@@ -1,92 +1,233 @@
-FROM mcr.microsoft.com/vscode/devcontainers/base:ubuntu-22.04 AS qemu-builder
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    libepoxy-dev \
-    libfdt-dev \
-    libglib2.0-dev \
-    libgtk-3-dev \
-    libpixman-1-dev \
-    pkg-config \
-    python3 \
-    python3-dev \
-    python3-pip \
-    python3-venv \
-    git \
-    wget \
-    tar \
-    gzip \
-    zlib1g-dev
-RUN pip install tomli ninja poetry
-RUN wget https://github.com/qemu/qemu/archive/refs/tags/v10.2.1.tar.gz -O /tmp/qemu.tar.gz
-RUN tar -xzf /tmp/qemu.tar.gz && \
-    cd qemu-10.2.1 && \
-    ./configure --target-list=aarch64-softmmu --enable-gtk && \
-    make -j$(nproc) && \
-    make install
+#
+#  Dockerfile for building/testing Project MU with GCC.
+#
+# NOTE: This file is automatically synchronized from Mu DevOps. Update the original file there
+#       instead of the file in this repo.
+#
+# - Mu DevOps Repo: https://github.com/microsoft/mu_devops
+# - File Sync Settings: https://github.com/microsoft/mu_devops/blob/main/.sync/Files.yml
+#
+#  Copyright (c) Microsoft Corporation
+#  SPDX-License-Identifier: BSD-2-Clause-Patent
+#
 
-FROM mcr.microsoft.com/vscode/devcontainers/base:ubuntu-22.04
-ARG DEBIAN_FRONTEND=noninteractive
+# NOTE: Because this pipeline YAML file is a Nunjucks template, the pipeline syntax of `{{}}` will conflict with
+#       Nunjucks style. Surround pipeline YAML code that uses `{{}}` within `raw` and `endraw` tags
+#       to allow it to pass through Nunjucks processing.
 
-# Install base packages first
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    lsb-release \
-    wget \
+#
+# The build container layer is intended for pipeline use and is the minimal set
+# of tools required for building Project MU.
+#
+FROM mcr.microsoft.com/devcontainers/base:ubuntu-24.04 AS build
+
+# Versions
+ARG GCC_MAJOR_VERSION=13
+ARG NASM_VERSION=2.16.01
+ARG CSPELL_VERSION=5.20.0
+ARG MARKDOWNLINT_VERSION=0.32.2
+
+# Visit this NuGet package version page to see the latest version available
+# https://dev.azure.com/projectmu/acpica/_artifacts/feed/mu_iasl/NuGet/edk2-acpica-iasl/versions
+ARG IASL_VERSION=20230628.0.1
+
+# Set environment variable to avoid interaction.
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=UTC
+
+# Work-around for azure pipelines adding the vsts_azpcontainer user, but not adding
+# the .local/bin directory to the path which will be used by pip.
+ENV PATH=$PATH:/home/vsts_azpcontainer/.local/bin
+
+RUN apt-get update && \
+    apt-get install --yes --no-install-recommends \
     software-properties-common \
-    gnupg \
-    curl
-
-# Install LLVM repo
-RUN bash -c "$(wget -O - https://apt.llvm.org/llvm.sh)" 20
-
-# Install build dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    binutils-aarch64-linux-gnu \
+    && \
+    apt-get update && \
+    apt-get install --yes --no-install-recommends \
     bison \
-    build-essential \
     ca-certificates \
-    crossbuild-essential-arm64 \
+    clang \
+    curl \
     device-tree-compiler \
     flex \
-    g++-aarch64-linux-gnu \
-    gcc-aarch64-linux-gnu \
-    gcc-arm-none-eabi \
     git \
-    iasl \
-    libc6-dev-arm64-cross \
-    libepoxy-dev \
-    libfdt-dev \
-    libglib2.0-dev \
-    libgtk-3-dev \
-    libncurses5-dev \
+    gnupg \
+    gnupg2 \
+    lcov \
     libssl-dev \
     lld \
     llvm \
+    jq \
+    m4 \
     make \
+    mono-complete \
     nasm \
-    ovmf \
-    pkg-config \
-    python3 \
-    python3-dev \
-    python3-pip \
-    python3-venv \
-    qemu-efi \
-    qemu-utils \
-    seabios \
+    npm \
+    sudo \
+    unzip \
     uuid-dev \
-    uuid-runtime
+    wget \
+    python3 \
+    python3-venv \
+    g++-${GCC_MAJOR_VERSION} gcc-${GCC_MAJOR_VERSION} \
+    gcc-${GCC_MAJOR_VERSION}-x86-64-linux-gnux32 \
+    gcc-${GCC_MAJOR_VERSION}-aarch64-linux-gnu \
+    gcc-${GCC_MAJOR_VERSION}-riscv64-linux-gnu \
+    gcc-${GCC_MAJOR_VERSION}-arm-linux-gnueabi \
+    gcc-${GCC_MAJOR_VERSION}-arm-linux-gnueabihf \
+    && \
+    python3 -m venv /opt/venv && \
+    chmod -R g+w,o+w /opt/venv && \
+    /opt/venv/bin/pip install --upgrade pip setuptools && \
+    apt-get upgrade -y && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
-RUN pip install tomli ninja poetry
+ENV PATH="/opt/venv/bin:$PATH"
+ENV GCC5_AARCH64_PREFIX /usr/bin/aarch64-linux-gnu-
+ENV GCC5_ARM_PREFIX     /usr/bin/arm-linux-gnueabi-
+ENV GCC5_RISCV64_PREFIX /usr/bin/riscv64-linux-gnu-
 
-# Install QEMU 10 from builder image
-COPY --from=qemu-builder /usr/local/bin/qemu-system-aarch64 /usr/local/bin/qemu-system-aarch64
-COPY --from=qemu-builder /usr/local/bin/qemu-img /usr/local/bin/qemu-img
-COPY --from=qemu-builder /usr/local/share/qemu /usr/local/share/qemu
+RUN pip install pip lcov_cobertura --upgrade
 
-# Setup Default Clang
-RUN update-alternatives --install /usr/bin/clang clang /usr/bin/clang-20 200
-RUN update-alternatives --install /usr/bin/ld.lld lld /usr/bin/lld-20 200
-RUN update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-20 200
+# RUN npm install -g npm
+RUN npm install -g \
+    cspell@${CSPELL_VERSION} \
+    markdownlint-cli@${MARKDOWNLINT_VERSION}
 
-ENV PATH="/usr/lib/llvm-20/bin:${PATH}"
+RUN wget -O - https://www.nasm.us/pub/nasm/releasebuilds/${NASM_VERSION}/nasm-${NASM_VERSION}.tar.gz | \
+    tar xz && cd nasm-${NASM_VERSION} && \
+    ./autogen.sh && ./configure && make -j $(nproc) && make install && \
+    cd .. && rm -rf nasm-${NASM_VERSION}
 
-USER vscode
+RUN mkdir -p iasl_temp && cd iasl_temp && \
+    wget -O iasl_${IASL_VERSION}.nupkg "https://pkgs.dev.azure.com/projectmu/acpica/_apis/packaging/feeds/mu_iasl/nuget/packages/edk2-acpica-iasl/versions/${IASL_VERSION}/content?api-version=6.0-preview.1" && \
+    unzip iasl_${IASL_VERSION}.nupkg -d /iasl_pkg_contents && \
+    cp /iasl_pkg_contents/edk2-acpica-iasl/Linux-x86/iasl /usr/bin/iasl && chmod +x /usr/bin/iasl && \
+    cd .. && rm -rf iasl_temp
+
+RUN if [ "$(arch)" = "x86_64" ]; then \
+    wget -q "https://packages.microsoft.com/config/ubuntu/$(lsb_release -rs)/packages-microsoft-prod.deb" && \
+    dpkg -i packages-microsoft-prod.deb && rm packages-microsoft-prod.deb && \
+    apt-get update && apt-get install -y powershell && apt-get clean; \
+    fi
+
+#
+# Rust support
+#
+
+ENV CARGO_HOME="$HOME/.cargo"
+ENV RUSTUP_HOME="$HOME/.rustup"
+ENV PATH="$CARGO_HOME/bin:$PATH"
+
+# Install Rust/Cargo and extras (rust-src, rust fmt, cargo-make, cargo-tarpaulin)
+RUN RUST_VERSION=1.92.0 && \
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal && \
+    rustup component add rustfmt rust-src --toolchain ${RUST_VERSION}-x86_64-unknown-linux-gnu
+
+RUN mkdir cargo_downloads && \
+    cd cargo_downloads && \
+    TAG_NAME=0.37.24 && \
+    DOWNLOAD_URL="https://github.com/sagiegurari/cargo-make/releases/download/$TAG_NAME/cargo-make-v$TAG_NAME-x86_64-unknown-linux-gnu.zip" && \
+    curl -L -o cargo-make.zip "$DOWNLOAD_URL" && \
+    unzip cargo-make.zip && \
+    mv cargo-make-v$TAG_NAME-x86_64-unknown-linux-gnu/cargo-make $CARGO_HOME/bin/ && \
+    TAG_NAME=0.31.5 && \
+    DOWNLOAD_URL="https://github.com/xd009642/tarpaulin/releases/download/$TAG_NAME/cargo-tarpaulin-x86_64-unknown-linux-gnu.tar.gz" && \
+    curl -L -o cargo-tarpaulin.tar.gz "$DOWNLOAD_URL" && \
+    tar -xzvf cargo-tarpaulin.tar.gz && \
+    mv cargo-tarpaulin $CARGO_HOME/bin/ && \
+    cd .. && \
+    rm -r cargo_downloads
+
+#
+# Alternatives
+#
+
+
+RUN update-alternatives \
+    --install /usr/bin/python python /usr/bin/python3.12 1 && \
+    update-alternatives \
+    --install /usr/bin/python3 python3 /usr/bin/python3.12 1 && \
+    update-alternatives \
+    --install /usr/bin/gcc gcc /usr/bin/gcc-${GCC_MAJOR_VERSION} 100 \
+    --slave /usr/bin/g++ g++ /usr/bin/g++-${GCC_MAJOR_VERSION} \
+    --slave /usr/bin/gcc-ar gcc-ar /usr/bin/gcc-ar-${GCC_MAJOR_VERSION} \
+    --slave /usr/bin/gcc-nm gcc-nm /usr/bin/gcc-nm-${GCC_MAJOR_VERSION} \
+    --slave /usr/bin/gcc-ranlib gcc-ranlib /usr/bin/gcc-ranlib-${GCC_MAJOR_VERSION} \
+    --slave /usr/bin/gcov gcov /usr/bin/gcov-${GCC_MAJOR_VERSION} && \
+    update-alternatives --remove-all cpp && \
+    update-alternatives \
+    --install /usr/bin/cpp cpp /usr/bin/cpp-${GCC_MAJOR_VERSION} 100 && \
+    update-alternatives \
+    --install /usr/bin/aarch64-linux-gnu-gcc aarch64-linux-gnu-gcc /usr/bin/aarch64-linux-gnu-gcc-${GCC_MAJOR_VERSION} 100 \
+    --slave /usr/bin/aarch64-linux-gnu-cpp aarch64-linux-gnu-cpp /usr/bin/aarch64-linux-gnu-cpp-${GCC_MAJOR_VERSION} \
+    --slave /usr/bin/aarch64-linux-gnu-g++ aarch64-linux-gnu-g++ /usr/bin/aarch64-linux-gnu-g++-${GCC_MAJOR_VERSION} \
+    --slave /usr/bin/aarch64-linux-gnu-gcc-ar aarch64-linux-gnu-gcc-ar /usr/bin/aarch64-linux-gnu-gcc-ar-${GCC_MAJOR_VERSION} \
+    --slave /usr/bin/aarch64-linux-gnu-gcc-nm aarch64-linux-gnu-gcc-nm /usr/bin/aarch64-linux-gnu-gcc-nm-${GCC_MAJOR_VERSION} \
+    --slave /usr/bin/aarch64-linux-gnu-gcc-ranlib aarch64-linux-gnu-gcc-ranlib /usr/bin/aarch64-linux-gnu-gcc-ranlib-${GCC_MAJOR_VERSION} \
+    --slave /usr/bin/aarch64-linux-gnu-gcov aarch64-linux-gnu-gcov /usr/bin/aarch64-linux-gnu-gcov-${GCC_MAJOR_VERSION} && \
+    update-alternatives \
+    --install /usr/bin/arm-linux-gnueabi-gcc arm-linux-gnueabi-gcc /usr/bin/arm-linux-gnueabi-gcc-${GCC_MAJOR_VERSION} 100 \
+    --slave /usr/bin/arm-linux-gnueabi-cpp arm-linux-gnueabi-cpp /usr/bin/arm-linux-gnueabi-cpp-${GCC_MAJOR_VERSION} \
+    --slave /usr/bin/arm-linux-gnueabi-g++ arm-linux-gnueabi-g++ /usr/bin/arm-linux-gnueabi-g++-${GCC_MAJOR_VERSION} \
+    --slave /usr/bin/arm-linux-gnueabi-gcc-ar arm-linux-gnueabi-gcc-ar /usr/bin/arm-linux-gnueabi-gcc-ar-${GCC_MAJOR_VERSION} \
+    --slave /usr/bin/arm-linux-gnueabi-gcc-nm arm-linux-gnueabi-gcc-nm /usr/bin/arm-linux-gnueabi-gcc-nm-${GCC_MAJOR_VERSION} \
+    --slave /usr/bin/arm-linux-gnueabi-gcc-ranlib arm-linux-gnueabi-gcc-ranlib /usr/bin/arm-linux-gnueabi-gcc-ranlib-${GCC_MAJOR_VERSION} \
+    --slave /usr/bin/arm-linux-gnueabi-gcov arm-linux-gnueabi-gcov /usr/bin/arm-linux-gnueabi-gcov-${GCC_MAJOR_VERSION} && \
+    update-alternatives \
+    --install /usr/bin/riscv64-linux-gnu-gcc riscv64-linux-gnu-gcc /usr/bin/riscv64-linux-gnu-gcc-${GCC_MAJOR_VERSION} 100 \
+    --slave /usr/bin/riscv64-linux-gnu-cpp riscv64-linux-gnu-cpp /usr/bin/riscv64-linux-gnu-cpp-${GCC_MAJOR_VERSION} \
+    --slave /usr/bin/riscv64-linux-gnu-g++ riscv64-linux-gnu-g++ /usr/bin/riscv64-linux-gnu-g++-${GCC_MAJOR_VERSION} \
+    --slave /usr/bin/riscv64-linux-gnu-gcc-ar riscv64-linux-gnu-gcc-ar /usr/bin/riscv64-linux-gnu-gcc-ar-${GCC_MAJOR_VERSION} \
+    --slave /usr/bin/riscv64-linux-gnu-gcc-nm riscv64-linux-gnu-gcc-nm /usr/bin/riscv64-linux-gnu-gcc-nm-${GCC_MAJOR_VERSION} \
+    --slave /usr/bin/riscv64-linux-gnu-gcc-ranlib riscv64-linux-gnu-gcc-ranlib /usr/bin/riscv64-linux-gnu-gcc-ranlib-${GCC_MAJOR_VERSION} \
+    --slave /usr/bin/riscv64-linux-gnu-gcov riscv64-linux-gnu-gcov /usr/bin/riscv64-linux-gnu-gcov-${GCC_MAJOR_VERSION}
+
+#
+# The test container layer is intended for pipeline use and virtual platform tools
+# on top of the base build image.
+#
+FROM build AS test
+
+ARG QEMU_URL="https://gitlab.com/qemu-project/qemu.git"
+ARG QEMU_BRANCH="v10.0.0"
+
+RUN apt-get update && apt-get install --yes --no-install-recommends \
+    autoconf \
+    automake \
+    autotools-dev \
+    bc \
+    build-essential \
+    dosfstools \
+    gcc \
+    libglib2.0-dev \
+    libgtk-3-dev \
+    libpixman-1-dev \
+    libsdl2-dev \
+    mtools \
+    ninja-build \
+    tar \
+    && \
+    git clone "${QEMU_URL}" --branch "${QEMU_BRANCH}" --depth 1 qemu && \
+    cd qemu && \
+    ./configure --target-list=x86_64-softmmu,aarch64-softmmu --enable-gtk && \
+    make install -j $(nproc) && \
+    cd .. && \
+    rm -rf qemu && \
+    apt remove --yes ninja-build && \
+    apt-get clean
+
+#
+# The dev container layer is intended for local use and has more robust tooling
+# and environment configurations for developers.
+#
+FROM test AS dev
+
+RUN apt-get update && \
+    apt-get install --yes --no-install-recommends \
+    nano \
+    less \
+    && \
+    apt-get clean

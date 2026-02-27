@@ -1,45 +1,42 @@
+# ODP SBSA Build file
+#
+# ## License
+#
+# Copyright (c) Microsoft Corporation.
+#
+# SPDX-License-Identifier: Apache-2.0
+
+
 # ------------------------------------------------------------
 # Workspace setup
 # ------------------------------------------------------------
 WORKSPACE ?= $(CURDIR)
 
-HAFNIUM_DIR  := $(WORKSPACE)/spm
-TFA_DIR      := $(WORKSPACE)/tf-a
-UEFI_DIR     := $(WORKSPACE)/uefi
-
 # ------------------------------------------------------------
 # Default target
 # ------------------------------------------------------------
-all: hafnium tfa uefi
-
-# ------------------------------------------------------------
-# Build Hafnium
-# ------------------------------------------------------------
-hafnium:
-	@echo "=== Building Hafnium ==="
-	$(MAKE) -C $(HAFNIUM_DIR)
-
-# ------------------------------------------------------------
-# Build TF-A
-# ------------------------------------------------------------
-tfa:
-	@echo "=== Building TF-A ==="
-	$(MAKE) -C $(TFA_DIR)
+all: bios
 
 # ------------------------------------------------------------
 # Build UEFI
 # ------------------------------------------------------------
-uefi:
-	@echo "=== Building UEFI ==="
-	$(MAKE) -C $(UEFI_DIR)
+bios:
+	@echo "=== Building BIOS ==="
+	stuart_setup -c bios/Platforms/QemuSbsaPkg/PlatformBuild.py
+	stuart_update -c bios/Platforms/QemuSbsaPkg/PlatformBuild.py
+	stuart_build -c bios/Platforms/QemuSbsaPkg/PlatformBuild.py
+
+# ------------------------------------------------------------
+# Run QEMU with the built BIOS
+# ------------------------------------------------------------
+run: bios
+	@echo "=== Running QEMU ==="
+	stuart_build -c bios/Platforms/QemuSbsaPkg/PlatformBuild.py --flashrom
 
 # ------------------------------------------------------------
 # Clean everything
 # ------------------------------------------------------------
 clean:
 	@echo "=== Cleaning all components ==="
-	$(MAKE) -C $(HAFNIUM_DIR) clean
-	$(MAKE) -C $(TFA_DIR) clean
-	$(MAKE) -C $(UEFI_DIR) clean
 
-.PHONY: all hafnium tfa uefi clean
+.PHONY: all bios clean
