@@ -8,6 +8,12 @@
 
 #[cfg(target_os = "none")]
 mod baremetal;
+// NOT cfg-gated: host unit tests in `mctp_ping::tests` need to compile under
+// the `x86_64-unknown-linux-gnu` target too. The module is unused from main
+// in plan 16-02 (call site lands in plan 16-03); allow dead_code in the
+// interim so the host build stays warning-clean.
+#[allow(dead_code)]
+mod mctp_ping;
 
 #[cfg(not(target_os = "none"))]
 fn main() {
