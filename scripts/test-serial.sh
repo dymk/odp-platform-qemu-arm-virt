@@ -17,7 +17,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib/swtpm.sh"
 # shellcheck source=lib/ec-qemu.sh
 source "$SCRIPT_DIR/lib/ec-qemu.sh"
-# Phase 16 (PP-04): PTY raw-mode helper — D-8 AMENDED canonical location.
+# PTY raw-mode helper. Must run BEFORE SBSA QEMU opens the PTY so the kernel
+# tty line discipline doesn't mangle MCTP framing bytes (0x7E flag, 0x7D
+# escape, control codes).
 # shellcheck source=lib/pty-raw.sh
 source "$SCRIPT_DIR/lib/pty-raw.sh"
 
@@ -105,7 +107,14 @@ esac
 
 if [ "$FAULT_INJECT" = "sbsa-hang" ]; then
     SBSA_TIMEOUT=2
-    echo "FAULT_INJECT=sbsa-hang: SBSA_TIMEOUT overridden to 2 (expect timeout(1) exit 124)" >&2
+    # Clamp EC_TIMEOUT too: with SBSA reaped at 2s the EC pipeline must not
+    # outlive it (otherwise cleanup waits up to the original EC_TIMEOUT).
+    # Cap at SBSA_TIMEOUT but never below the EC_TIMEOUT validator's `>0`
+    # contract.
+    if [ "$EC_TIMEOUT" -gt "$SBSA_TIMEOUT" ]; then
+        EC_TIMEOUT="$SBSA_TIMEOUT"
+    fi
+    echo "FAULT_INJECT=sbsa-hang: SBSA_TIMEOUT overridden to 2 (expect timeout(1) exit 124); EC_TIMEOUT clamped to $EC_TIMEOUT" >&2
 fi
 
 SWTPM_STATE="$BUILD_DIR/swtpm-state"
@@ -119,6 +128,18 @@ SBSA_SERIAL_LOG="$BUILD_DIR/sbsa-serial-output.log"
 EC_PID=""
 SWTPM_PID=""
 FAULT_RACE_PID=""
+
+# Unique tag baked into the SBSA QEMU `-name` argument (and used by every
+# `pkill -f` that targets the SBSA process). Replaces the pre-fix `pkill -P
+# $$ -f qemu-system-aarch64` pattern which matched no PIDs (qemu's parent is
+# `timeout(1)`, not the orchestrator shell, so the -P filter excluded the
+# real qemu) and risked accidental cross-job kills if -P were dropped.
+SBSA_TAG="sbsa-test-$$"
+
+# Cleanup log — captures stderr from in-trap pkill/wait so that a noisy
+# teardown (e.g. SIGSTOPed children that wouldn't accept SIGTERM) leaves a
+# breadcrumb instead of polluting the main test output.
+CLEANUP_LOG=""
 
 # Tear down the EC session (no-op if EC_PID is unset).
 #
@@ -144,24 +165,29 @@ kill_ec_session() {
 cleanup() {
     # SC2317: invoked via `trap ... EXIT`, not statically reachable.
     # shellcheck disable=SC2317
-    kill_ec_session
-    # shellcheck disable=SC2317
-    if [ -n "$SWTPM_PID" ]; then
-        kill "$SWTPM_PID" 2>/dev/null
-        wait "$SWTPM_PID" 2>/dev/null
-    fi
-    # shellcheck disable=SC2317
-    if [ -n "$FAULT_RACE_PID" ]; then
-        kill "$FAULT_RACE_PID" 2>/dev/null
-        wait "$FAULT_RACE_PID" 2>/dev/null
-    fi
-    # shellcheck disable=SC2317
-    true
+    {
+        kill_ec_session
+        if [ -n "$SWTPM_PID" ]; then
+            kill "$SWTPM_PID" 2>/dev/null
+            wait "$SWTPM_PID" 2>/dev/null
+        fi
+        if [ -n "$FAULT_RACE_PID" ]; then
+            kill "$FAULT_RACE_PID" 2>/dev/null
+            wait "$FAULT_RACE_PID" 2>/dev/null
+        fi
+        # Belt-and-braces: any orphaned SBSA QEMU tagged with our session's
+        # SBSA_TAG (rare — should already be reaped by the foreground
+        # `timeout` or the sp-no-call race-killer). Matches against the
+        # qemu cmdline so it is scoped to *this* test run only.
+        pkill -KILL -f "$SBSA_TAG" 2>/dev/null
+        true
+    } 2> >(if [ -n "$CLEANUP_LOG" ]; then tee -a "$CLEANUP_LOG" >&2; else cat >&2; fi)
 }
 trap cleanup EXIT
 
 mkdir -p "$BUILD_DIR" "$SWTPM_STATE"
-rm -f "$EC_OUT_LOG" "$EC_ERR_LOG" "$EC_SERIAL_LOG" "$SBSA_SERIAL_LOG" "$SWTPM_SOCK"
+CLEANUP_LOG="$BUILD_DIR/cleanup.log"
+rm -f "$EC_OUT_LOG" "$EC_ERR_LOG" "$EC_SERIAL_LOG" "$SBSA_SERIAL_LOG" "$SWTPM_SOCK" "$CLEANUP_LOG"
 
 # 1. swtpm
 start_swtpm "$SWTPM_STATE" "$SWTPM_SOCK" "$SWTPM_LOG"
@@ -177,22 +203,20 @@ start_ec_qemu "$EC_ELF" "$EC_OUT_LOG" "$EC_ERR_LOG" "$EC_SERIAL_LOG" "$EC_TIMEOU
 PTY=$(discover_ec_pty "$EC_OUT_LOG" "$EC_ERR_LOG") || exit 1
 echo "EC PTY: $PTY — launching SBSA QEMU"
 
-# Phase 16 / PP-04 — assert PTY is in raw mode BEFORE SBSA QEMU opens it.
-# Prevents the kernel TTY line discipline from mangling MCTP framing bytes
-# (0x7E flag, 0x7D escape, control codes). See scripts/lib/pty-raw.sh.
-assert_pty_raw "$PTY" || { echo "FATAL: cannot put $PTY in raw mode" >&2; exit 1; }
+# signature-emitter:pty-raw-enforce
+# Put PTY into raw mode BEFORE SBSA QEMU opens it. Prevents the kernel TTY
+# line discipline from mangling MCTP framing bytes (0x7E flag, 0x7D escape,
+# control codes). See scripts/lib/pty-raw.sh.
+enforce_pty_raw "$PTY" || { echo "FATAL: cannot put $PTY in raw mode" >&2; exit 1; }
 
-# FAULT_INJECT=ec-silent — freeze the EC after PTY is up so SP-side MCTP
-# timeout fires (signature d). Use SIGSTOP on the session leader; if pgrp
-# routing leaks (see kill_ec_session comment above), widen via
-# `pkill -STOP -s "$EC_PID"` per Phase-17 deviation_policy #1.
+# signature-emitter:fault-ec-silent
+# FAULT_INJECT=ec-silent — freeze the EC after PTY is up so the SP-side MCTP
+# timeout fires (expected outcome: MCTP_PING_FAIL timeout). SIGSTOP via
+# `pkill -s "$EC_PID"` reaches every process group in the session — the
+# leader-only kill leaks because each pipeline stage (timeout/qemu/tee/
+# defmt-print) is in its own pgrp inside the session.
 if [ "$FAULT_INJECT" = "ec-silent" ]; then
     echo "FAULT_INJECT=ec-silent: SIGSTOP'ing EC session led by EC_PID=$EC_PID" >&2
-    # Per Phase 17 deviation_policy #1: SIGSTOP on the leader alone leaks
-    # because the timeout/qemu/tee/defmt-print stages each get their own
-    # process group inside the session (job control quirk — see comment on
-    # kill_ec_session above). Use `pkill -STOP -s` to STOP every process in
-    # the session.
     pkill -STOP -s "$EC_PID" 2>/dev/null \
         || echo "WARN: pkill -STOP -s $EC_PID failed (session may have already exited)" >&2
 fi
@@ -200,19 +224,26 @@ fi
 # 3. SBSA QEMU
 SBSA_EXIT=0
 
-# FAULT_INJECT=sp-no-call — race-kill qemu-system-aarch64 ~2s into boot,
-# well before SP reaches send_mctp_ping. Helper PID stashed for cleanup
-# trap. `pkill -P $$` restricts to children of THIS shell only.
+# signature-emitter:fault-sp-no-call
+# FAULT_INJECT=sp-no-call — race-kill the SBSA QEMU ~2s into boot, well
+# before SP reaches send_mctp_ping. Targeting is by SBSA_TAG (baked into
+# qemu's `-name` arg below) — the previous `pkill -P $$ -f qemu-system-
+# aarch64` pattern matched no PIDs because qemu's parent is `timeout(1)`,
+# not the orchestrator shell. SBSA_TAG includes the orchestrator PID so it
+# is unique across concurrent runs.
 if [ "$FAULT_INJECT" = "sp-no-call" ]; then
-    echo "FAULT_INJECT=sp-no-call: race-killing qemu-system-aarch64 in 2s" >&2
-    # `pkill -f` matches against the full command line (not the 15-char
-    # truncated comm). `-P $$` restricts to children of THIS shell only.
-    ( sleep 2 && pkill -P $$ -9 -f qemu-system-aarch64 ) &
+    echo "FAULT_INJECT=sp-no-call: race-killing SBSA QEMU (tag=$SBSA_TAG) in 2s" >&2
+    ( sleep 2 && pkill -KILL -f "$SBSA_TAG" 2>/dev/null ) &
     FAULT_RACE_PID=$!
 fi
 
+# signature-emitter:sbsa-qemu-launch
+# `-name "$SBSA_TAG"` makes the SBSA QEMU process greppable by sp-no-call /
+# cleanup. The tag is unique-per-orchestrator-pid so this is safe under
+# concurrent test runs.
 timeout "$SBSA_TIMEOUT" \
     qemu-system-aarch64 \
+        -name "$SBSA_TAG" \
         "$@" \
         -drive "if=pflash,format=raw,unit=0,file=$BIOS_FV_DIR/SECURE_FLASH0.fd" \
         -drive "if=pflash,format=raw,unit=1,file=$BIOS_FV_DIR/QEMU_EFI.fd,readonly=on" \
@@ -259,11 +290,12 @@ else
     echo "SBSA: WARNING — no serial output captured (may be OK if boot is slow)"
 fi
 
-# Phase 16 / PP-02 — MCTP ping-pong assertion.
-# PASS condition: SBSA serial log contains MCTP_PING_OK and NOT MCTP_PING_FAIL.
-# FAIL conditions: MCTP_PING_FAIL line OR neither marker present.
-# Note (D-4 / PP-03): no log-grep readiness handshake here — SP-side timeout (which
-# surfaces as MCTP_PING_FAIL timeout) is the cold-start failure-detection mechanism.
+# signature-emitter:mctp-ping-verify
+# MCTP ping-pong assertion. PASS: SBSA serial log contains MCTP_PING_OK and
+# NOT MCTP_PING_FAIL. FAIL: MCTP_PING_FAIL line OR neither marker present.
+# There is intentionally no log-grep readiness handshake here — the SP-side
+# timeout (surfaced as `MCTP_PING_FAIL timeout`) is the cold-start
+# failure-detection mechanism.
 if grep -q "MCTP_PING_FAIL" "$SBSA_SERIAL_LOG" 2>/dev/null; then
     fail_line=$(grep "MCTP_PING_FAIL" "$SBSA_SERIAL_LOG" | head -1)
     echo "MCTP: PING FAILED -- $fail_line"
@@ -272,7 +304,7 @@ elif grep -q "MCTP_PING_OK" "$SBSA_SERIAL_LOG" 2>/dev/null; then
     ok_line=$(grep "MCTP_PING_OK" "$SBSA_SERIAL_LOG" | head -1)
     echo "MCTP: ping OK -- $ok_line"
 else
-    echo "MCTP: NEITHER MCTP_PING_OK nor MCTP_PING_FAIL seen in $SBSA_SERIAL_LOG"
+    echo "MCTP: neither MCTP_PING_OK nor MCTP_PING_FAIL seen in $SBSA_SERIAL_LOG"
     PASS=false
 fi
 

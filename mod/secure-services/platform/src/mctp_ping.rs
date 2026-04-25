@@ -1,33 +1,55 @@
-//! Phase 16 boot-time MCTP ping (D-1, D-3 AMENDED, D-13).
+//! Boot-time MCTP ping helper.
 //!
 //! Sends one Battery::GetSta request to the EC over the SBSA secure UART and
 //! logs exactly one of:
-//!   - `MCTP_PING_OK service_id=8 msg_id=<n> is_error=<0|1>`  (D-2 AMENDED)
-//!   - `MCTP_PING_FAIL <reason>`  where <reason> ∈ {timeout, framer_encode_error, framer_decode_error}
+//!   - `MCTP_PING_OK service_id=8 msg_id=<n> is_error=<0|1>`
+//!   - `MCTP_PING_FAIL <reason>`
 //!
-//! See `.planning/phases/16-ping-pong-end-to-end/16-CONTEXT.md` for locked
-//! decisions. Helper is host-testable via `MockMmio` (Phase 14 pattern); see
-//! the `#[cfg(test)] mod tests` block below.
+//! Where `<reason>` is one of the [`MctpPingError`] `Display` strings:
+//! `"timeout"`, `"framer_encode_error"`, `"framer_decode_error"`. The CI
+//! harness (`scripts/test-serial.sh`) greps for these literal markers, so
+//! the [`core::fmt::Display`] impl on [`MctpPingError`] is the contract.
+
+use core::fmt;
 
 use qemu_sp_uart::{Error as UartError, Mmio, Pl011Uart};
 use sp_mctp_framer::{decode_battery_response, encode_battery_request};
 
-/// First-byte RX budget. In production, MUST be `u32::MAX` per Phase 14
-/// carry-forward (`DEFAULT_RX_TIMEOUT_ITERS` of 1_000_000 exhausts in
-/// milliseconds on QEMU SBSA before the EC even gets to TX). Under
-/// `#[cfg(test)]` we shrink to keep the timeout-branch test sub-second on
-/// host (M-2 minor recommendation in 16-02-PLAN).
+/// MCTP service id for the Battery service. Used to gate the ACCEPT decision
+/// on the decoded reply — any well-formed frame whose `service_id` differs
+/// from this value is treated as a decode error.
+const BATTERY_SERVICE_ID: u8 = 8;
+
+/// First-byte RX iteration budget.
+///
+/// In production this is `u32::MAX` because [`Pl011Uart::read_byte_timeout`]
+/// is a busy-spin (no timer); on QEMU SBSA an EC round-trip takes seconds of
+/// wall-clock and the smaller [`NTH_BYTE_BUDGET`] would always exhaust before
+/// the first byte arrives. Once the first byte lands, subsequent bytes are
+/// emitted back-to-back and the smaller per-byte budget suffices.
+///
+/// Under `#[cfg(test)]` we shrink the budget so the timeout-branch unit test
+/// runs in milliseconds rather than seconds.
 #[cfg(not(test))]
 const FIRST_BYTE_BUDGET: u32 = u32::MAX;
 #[cfg(test)]
 const FIRST_BYTE_BUDGET: u32 = 1_000;
 
-/// Subsequent-byte RX budget. EC is actively transmitting → small budget OK.
-const NTH_BYTE_BUDGET: u32 = 1_000_000;
+/// Subsequent-byte RX iteration budget.
+///
+/// Sized for "EC is actively transmitting"; once we've seen byte 0 we expect
+/// the rest of the frame within a few hundred PL011 polls. This is the same
+/// value as `qemu-sp-uart::DEFAULT_RX_TIMEOUT_ITERS` (1M iterations ≈ a few
+/// milliseconds of QEMU wall-clock — long enough that legitimate jitter
+/// between bytes won't trip it, short enough that a stalled EC fails fast).
+const NTH_BYTE_BUDGET: u32 = qemu_sp_uart::DEFAULT_RX_TIMEOUT_ITERS;
 
-/// Owned, lifetime-free copy of the framer-decoded fields we surface in the
-/// OK marker. We don't return `BatteryResponse<'_>` directly to avoid
-/// borrowing the rx buffer (RESEARCH §3 lifetime caveat).
+/// Lifetime-free copy of the framer-decoded fields surfaced in the OK marker.
+///
+/// We avoid returning `BatteryResponse<'_>` directly because that would
+/// borrow from the caller's stack RX buffer, complicating composition with
+/// `log::info!` argument capture. The three fields below are the full
+/// contract emitted by the OK log line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DecodedFields {
     pub service_id: u8,
@@ -35,7 +57,37 @@ pub struct DecodedFields {
     pub message_id: u16,
 }
 
+/// Reasons a ping attempt can fail. The [`Display`] impl produces the exact
+/// strings the CI harness greps for in the `MCTP_PING_FAIL` log line —
+/// changing those strings is a contract change.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum MctpPingError {
+    /// `Pl011Uart::read_byte_timeout` exhausted its iteration budget without
+    /// seeing the next expected byte.
+    Timeout,
+    /// `sp_mctp_framer::encode_battery_request` rejected the request.
+    /// Typically a buffer-sizing or mctp-rs version-drift bug, not a wire
+    /// fault.
+    FramerEncode,
+    /// `sp_mctp_framer::decode_battery_response` rejected the reply, OR the
+    /// reply decoded cleanly but did not target the Battery service.
+    FramerDecode,
+}
+
+impl fmt::Display for MctpPingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Timeout => "timeout",
+            Self::FramerEncode => "framer_encode_error",
+            Self::FramerDecode => "framer_decode_error",
+        })
+    }
+}
+
 /// Public entry. Logs internally; never panics.
+///
+/// `log::error!` is used (not `info!`) because a `MCTP_PING_FAIL` is a
+/// harness-level test failure — the CI gate fails on its presence.
 pub fn send_mctp_ping<M: Mmio>(uart: &mut Pl011Uart<M>, battery_id: u8) {
     match try_send_mctp_ping(uart, battery_id) {
         Ok(fields) => log::info!(
@@ -48,15 +100,15 @@ pub fn send_mctp_ping<M: Mmio>(uart: &mut Pl011Uart<M>, battery_id: u8) {
     }
 }
 
-/// Test-friendly inner helper. Returns one of the 3 D-3 (AMENDED) reason
-/// strings on Err: `"timeout"`, `"framer_encode_error"`, `"framer_decode_error"`.
+/// Test-friendly inner helper. Returns one of the three [`MctpPingError`]
+/// variants on failure.
 fn try_send_mctp_ping<M: Mmio>(
     uart: &mut Pl011Uart<M>,
     battery_id: u8,
-) -> Result<DecodedFields, &'static str> {
+) -> Result<DecodedFields, MctpPingError> {
     // 1. Encode the GetSta request.
     let mut tx = [0u8; 32];
-    let n = encode_battery_request(&mut tx, battery_id).map_err(|_| "framer_encode_error")?;
+    let n = encode_battery_request(&mut tx, battery_id).map_err(|_| MctpPingError::FramerEncode)?;
 
     // 2. Transmit (cannot fail — Pl011Uart::write_bytes returns ()).
     uart.write_bytes(&tx[..n]);
@@ -65,32 +117,39 @@ fn try_send_mctp_ping<M: Mmio>(
     let mut rx = [0u8; 32];
     rx[0] = uart
         .read_byte_timeout(FIRST_BYTE_BUDGET)
-        .map_err(|UartError::Timeout| "timeout")?;
+        .map_err(|UartError::Timeout| MctpPingError::Timeout)?;
 
-    // 4. Read header bytes [1..4) so we can derive total length per framer
-    //    rule: needed = 4 + rx[2] (sp-mctp-framer/src/lib.rs:204-205).
+    // 4. Read header bytes [1..4) so we can derive total length per the
+    //    framer rule: needed = 4 + rx[2] (SmbusEspi byte_count field).
     for slot in rx.iter_mut().take(4).skip(1) {
         *slot = uart
             .read_byte_timeout(NTH_BYTE_BUDGET)
-            .map_err(|UartError::Timeout| "timeout")?;
+            .map_err(|UartError::Timeout| MctpPingError::Timeout)?;
     }
     let needed = 4 + rx[2] as usize;
     if needed > rx.len() {
-        // Pathological length — surface as decode error.
-        return Err("framer_decode_error");
+        // Pathological wire-claimed length — surface as decode error. Note
+        // this also subsumes the FIFO state for the in-flight bytes; the
+        // caller (boot-time, one-shot) does not retry, so we don't drain.
+        return Err(MctpPingError::FramerDecode);
     }
 
     // 5. Read the rest of the frame.
     for slot in rx.iter_mut().take(needed).skip(4) {
         *slot = uart
             .read_byte_timeout(NTH_BYTE_BUDGET)
-            .map_err(|UartError::Timeout| "timeout")?;
+            .map_err(|UartError::Timeout| MctpPingError::Timeout)?;
     }
 
-    // 6. Decode and gate solely on service_id == 8 (Battery), per D-2 AMENDED.
-    let resp = decode_battery_response(&rx[..needed]).map_err(|_| "framer_decode_error")?;
-    if resp.service_id != 8 {
-        return Err("framer_decode_error");
+    // 6. Decode and gate on `service_id == BATTERY_SERVICE_ID` AND
+    //    `is_request == false` (we expect a response, not an echoed
+    //    request). Either mismatch surfaces as a decode error.
+    let resp = decode_battery_response(&rx[..needed]).map_err(|_| MctpPingError::FramerDecode)?;
+    if resp.is_request {
+        return Err(MctpPingError::FramerDecode);
+    }
+    if resp.service_id != BATTERY_SERVICE_ID {
+        return Err(MctpPingError::FramerDecode);
     }
     Ok(DecodedFields {
         service_id: resp.service_id,
@@ -100,14 +159,14 @@ fn try_send_mctp_ping<M: Mmio>(
 }
 
 // ---------------------------------------------------------------------------
-// Host unit tests (D-11). Run with:
+// Host unit tests. Run with:
 //   cd mod/secure-services/platform && \
 //     cargo test --bin qemu-ec-sp --target x86_64-unknown-linux-gnu
 //
-// MockMmio pattern adapted from qemu-sp-uart/src/lib.rs:160-228 (Phase 14):
-// `read*` are `&self` on the Mmio trait, so all interior state lives in
-// `RefCell`. We additionally wrap `tx_log` in `Rc<RefCell<_>>` so the test
-// can read it after the mock is moved into `Pl011Uart::new(_)`.
+// MockMmio uses the `Pl011Uart::mmio()` accessor (test-only convenience on
+// the driver) so the test can read the TX log and adjust the RXFE pattern
+// after the mock has been moved into `Pl011Uart::new(_)` — matches the
+// pattern used by `qemu-sp-uart`'s own tests.
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 extern crate std;
@@ -115,35 +174,50 @@ extern crate std;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qemu_sp_uart::{FR_RXFE, UARTDR, UARTFR};
+    use sp_mctp_framer::test_fixtures::{PHASE_12_RX_13B, PHASE_12_TX_18B};
     use std::cell::RefCell;
     use std::collections::VecDeque;
-    use std::rc::Rc;
     use std::vec::Vec;
 
-    // PL011 register offsets — keep in sync with qemu-sp-uart's internals.
-    const UARTDR: usize = 0x000;
-    const UARTFR: usize = 0x018;
-    // UARTFR flag bits we care about:
-    //   RXFE (bit 4 = 0x10): RX FIFO empty
-    //   TXFF (bit 5 = 0x20): TX FIFO full (we always report 0 — never full)
-    const FR_RXFE: u32 = 1 << 4;
-
+    /// Mock MMIO backend. Mirrors `qemu-sp-uart`'s test mock: state lives
+    /// inside `RefCell`s on the mock itself, accessed through
+    /// `Pl011Uart::mmio()` (cfg(test)-only accessor).
     struct MockMmio {
         rx_queue: RefCell<VecDeque<u8>>,
-        tx_log: Rc<RefCell<Vec<u8>>>,
+        /// Optional scripted UARTFR pattern. When non-empty, each
+        /// `read32(UARTFR)` pops one value (returning the default once
+        /// exhausted). When empty, falls back to the rxfe-from-queue rule.
+        fr_script: RefCell<VecDeque<u32>>,
+        tx_log: RefCell<Vec<u8>>,
     }
     impl MockMmio {
-        fn new(rx: &[u8], tx_log: Rc<RefCell<Vec<u8>>>) -> Self {
+        fn new(rx: &[u8]) -> Self {
             Self {
                 rx_queue: RefCell::new(rx.iter().copied().collect()),
-                tx_log,
+                fr_script: RefCell::new(VecDeque::new()),
+                tx_log: RefCell::new(Vec::new()),
             }
+        }
+        fn with_fr_script(rx: &[u8], script: &[u32]) -> Self {
+            Self {
+                rx_queue: RefCell::new(rx.iter().copied().collect()),
+                fr_script: RefCell::new(script.iter().copied().collect()),
+                tx_log: RefCell::new(Vec::new()),
+            }
+        }
+        fn tx_bytes(&self) -> Vec<u8> {
+            self.tx_log.borrow().clone()
         }
     }
     impl Mmio for MockMmio {
         unsafe fn read32(&self, off: usize) -> u32 {
             assert_eq!(off, UARTFR, "MockMmio only models UARTFR for read32");
-            // RXFE clear (data available) iff queue non-empty; TXFF always clear.
+            // Scripted pattern wins (used to model TXFF back-pressure).
+            if let Some(v) = self.fr_script.borrow_mut().pop_front() {
+                return v;
+            }
+            // Fallback: RXFE clear iff queue non-empty; TXFF always clear.
             if self.rx_queue.borrow().is_empty() {
                 FR_RXFE
             } else {
@@ -152,8 +226,6 @@ mod tests {
         }
         unsafe fn read8(&self, off: usize) -> u8 {
             assert_eq!(off, UARTDR);
-            // Pl011Uart reads UARTDR only after observing RXFE=0 (queue
-            // non-empty). Pop the next byte; panic if empty (bug).
             self.rx_queue
                 .borrow_mut()
                 .pop_front()
@@ -165,95 +237,117 @@ mod tests {
         }
     }
 
-    // Phase 12 golden TX fixture (18 bytes, D-11 + RESEARCH §2.2).
-    const PHASE_12_TX: [u8; 18] = [
-        0x00, 0x0f, 0x0e, 0x03, 0x01, 0x08, 0x80, 0xd3, 0x7d, 0x02, 0x08, 0x00, 0x0f, 0x02, 0x08,
-        0x00, 0x0f, 0x00,
-    ];
-    // Phase 12 golden RX fixture (13 bytes).
-    const PHASE_12_RX: [u8; 13] = [
-        0x00, 0x0f, 0x09, 0x03, 0x01, 0x80, 0x08, 0xd3, 0x7d, 0x00, 0x08, 0x80, 0x01,
-    ];
-
-    fn fresh_mock(rx: &[u8]) -> (MockMmio, Rc<RefCell<Vec<u8>>>) {
-        let tx_log = Rc::new(RefCell::new(Vec::new()));
-        let mock = MockMmio::new(rx, Rc::clone(&tx_log));
-        (mock, tx_log)
-    }
-
     #[test]
     fn ok_path_emits_correct_decoded_fields_and_writes_18_byte_tx() {
-        let (mock, tx_log) = fresh_mock(&PHASE_12_RX);
+        let mock = MockMmio::new(&PHASE_12_RX_13B);
         let mut uart = Pl011Uart::new(mock);
         let result = try_send_mctp_ping(&mut uart, /* battery_id = */ 0);
-        assert!(result.is_ok(), "expected Ok, got {:?}", result);
+        assert!(result.is_ok(), "expected Ok, got {result:?}");
         let fields = result.unwrap();
+        assert_eq!(fields.service_id, BATTERY_SERVICE_ID);
+        assert_eq!(fields.message_id, 1, "captured RX has message_id=1");
+        assert!(fields.is_error, "captured RX has is_error=1");
+        // TX-log must equal the captured 18-byte golden fixture exactly.
         assert_eq!(
-            fields.service_id, 8,
-            "OK gate is service_id==8 per D-2 AMENDED"
-        );
-        // message_id and is_error are informational only — pin to Phase 12
-        // spike values (RX[12]=0x01 → message_id=1; relay flags → is_error=true).
-        assert_eq!(
-            fields.message_id, 1,
-            "Phase 12 spike: EC mock returns message_id=1"
-        );
-        assert!(
-            fields.is_error,
-            "Phase 12 spike: EC mock returns is_error=1"
-        );
-        // TX-log must equal the Phase 12 18-byte golden fixture exactly.
-        let tx = tx_log.borrow();
-        assert_eq!(
-            &tx[..],
-            &PHASE_12_TX[..],
-            "TX log mismatch vs Phase 12 golden bytes"
+            uart.mmio_for_test().tx_bytes(),
+            PHASE_12_TX_18B.to_vec(),
+            "TX log mismatch vs captured wire bytes"
         );
     }
 
     #[test]
-    fn decode_error_when_rx_is_garbage() {
-        // 13 bytes of 0xFF: byte_count = 0xFF → needed = 4 + 255 = 259, but
-        // our internal rx buffer is 32 bytes → triggers the explicit
-        // "framer_decode_error" branch on pathological length BEFORE we
-        // would call `decode_battery_response`. Either way, mapped to
-        // `"framer_decode_error"` per D-3 AMENDED.
+    fn pathological_byte_count_returns_decode_error_and_does_not_swallow_tx() {
+        // 13 bytes of 0xFF: byte_count = 0xFF → needed = 4 + 255 = 259, our
+        // internal rx buffer is 32 → triggers the explicit pathological-
+        // length guard BEFORE `decode_battery_response` is called. The TX
+        // log must STILL contain the encoded request — a regression where
+        // the decode-failure path also dropped TX would be caught here.
         let garbage = [0xFFu8; 13];
-        let (mock, _tx) = fresh_mock(&garbage);
+        let mock = MockMmio::new(&garbage);
         let mut uart = Pl011Uart::new(mock);
         let result = try_send_mctp_ping(&mut uart, 0);
-        assert_eq!(result, Err("framer_decode_error"));
+        assert_eq!(result, Err(MctpPingError::FramerDecode));
+        assert_eq!(
+            uart.mmio_for_test().tx_bytes(),
+            PHASE_12_TX_18B.to_vec(),
+            "TX should have been emitted before RX failure"
+        );
     }
 
     #[test]
-    fn decode_error_when_rx_decodes_invalid_frame() {
-        // Length-coherent but semantically broken: 4-byte header with
-        // byte_count=0 → needed=4, decoder will reject it. Confirms the
-        // mapping from FramerError → "framer_decode_error" in the actual
-        // decoder branch (not just the pathological-length guard).
+    fn decoder_rejects_corrupt_but_length_coherent_frame() {
+        // Length-coherent (4-byte header, byte_count=0 → needed=4), but the
+        // first 4 bytes are not a valid SmbusEspi header. mctp-rs's
+        // deserializer rejects → mapped to FramerDecode by the
+        // framer-error branch (NOT the pathological-length guard).
         let broken: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
-        let (mock, _tx) = fresh_mock(&broken);
+        let mock = MockMmio::new(&broken);
         let mut uart = Pl011Uart::new(mock);
         let result = try_send_mctp_ping(&mut uart, 0);
-        assert_eq!(result, Err("framer_decode_error"));
+        assert_eq!(result, Err(MctpPingError::FramerDecode));
+    }
+
+    #[test]
+    fn decoder_rejects_response_with_wrong_service_id() {
+        // Take the captured Battery RX and flip the ODP service-id byte to
+        // 0x02 (Thermal). This produces a wire-correct, mctp-rs-parseable
+        // frame whose decoded `service_id != BATTERY_SERVICE_ID`. Catches a
+        // regression where the gate at the bottom of `try_send_mctp_ping`
+        // is removed or inverted.
+        let mut frame = PHASE_12_RX_13B;
+        frame[10] = 0x02; // ODP relay header byte 1 = service_id
+        let mock = MockMmio::new(&frame);
+        let mut uart = Pl011Uart::new(mock);
+        let result = try_send_mctp_ping(&mut uart, 0);
+        assert_eq!(result, Err(MctpPingError::FramerDecode));
+    }
+
+    #[test]
+    fn decoder_rejects_echoed_request_frame() {
+        // Feed back the SP's own request bytes. is_request=1 → SP must
+        // refuse to treat its own outbound frame as a reply.
+        let mock = MockMmio::new(&PHASE_12_TX_18B);
+        let mut uart = Pl011Uart::new(mock);
+        let result = try_send_mctp_ping(&mut uart, 0);
+        assert_eq!(result, Err(MctpPingError::FramerDecode));
     }
 
     #[test]
     fn timeout_when_rx_queue_empty() {
-        // Empty RX queue → RXFE reports set forever → first-byte
-        // read_byte_timeout exhausts FIRST_BYTE_BUDGET (1_000 under
-        // cfg(test) per M-2) and returns Err(Timeout) → mapped to
-        // "timeout" per D-3 AMENDED.
-        let (mock, _tx) = fresh_mock(&[]);
+        let mock = MockMmio::new(&[]);
         let mut uart = Pl011Uart::new(mock);
         let result = try_send_mctp_ping(&mut uart, 0);
-        assert_eq!(result, Err("timeout"));
+        assert_eq!(result, Err(MctpPingError::Timeout));
     }
 
-    // The "framer_encode_error" branch is exercise-by-inspection only.
-    // `encode_battery_request` only fails when the output buffer is
-    // <18 bytes (BufTooSmall) or mctp-rs internals reject the encode
-    // (EncodeFailed). Our caller passes a fixed 32-byte buffer that's
-    // always sufficient for the 18-byte GetSta encode. The mapping is
-    // covered by the framer's own Phase 15 unit tests.
+    #[test]
+    fn write_path_polls_txff_until_clear() {
+        // Script UARTFR to report TXFF=set for the first 2 polls of each TX
+        // byte, then clear, repeated for all 18 bytes. Confirms the driver
+        // honors back-pressure rather than blindly stuffing bytes (mock TXFF
+        // model gap flagged in code review T-5).
+        const FR_TXFF: u32 = 1 << 5;
+        let mut script = Vec::new();
+        for _ in 0..PHASE_12_TX_18B.len() {
+            script.push(FR_TXFF);
+            script.push(FR_TXFF);
+            script.push(0); // clear → write proceeds
+        }
+        // After TX, fall back to the queue-driven RXFE rule so the read
+        // path can complete normally with the captured RX bytes.
+        let mock = MockMmio::with_fr_script(&PHASE_12_RX_13B, &script);
+        let mut uart = Pl011Uart::new(mock);
+        let result = try_send_mctp_ping(&mut uart, 0);
+        assert!(result.is_ok(), "expected Ok with TXFF back-pressure, got {result:?}");
+        assert_eq!(uart.mmio_for_test().tx_bytes(), PHASE_12_TX_18B.to_vec());
+    }
+
+    #[test]
+    fn display_strings_match_harness_contract() {
+        // The CI harness greps for these literal substrings — pin them.
+        use std::format;
+        assert_eq!(format!("{}", MctpPingError::Timeout), "timeout");
+        assert_eq!(format!("{}", MctpPingError::FramerEncode), "framer_encode_error");
+        assert_eq!(format!("{}", MctpPingError::FramerDecode), "framer_decode_error");
+    }
 }

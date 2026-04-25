@@ -9,9 +9,9 @@
 #[cfg(target_os = "none")]
 mod baremetal;
 // NOT cfg-gated: host unit tests in `mctp_ping::tests` need to compile under
-// the `x86_64-unknown-linux-gnu` target too. Wired into bare-metal `main()`
-// in plan 16-03 (call site below); host build doesn't reference it but the
-// `#[cfg(test)] mod tests` block keeps it live there.
+// the `x86_64-unknown-linux-gnu` target too. The bare-metal `main()` calls
+// `send_mctp_ping` once at boot; the host build only reaches this module via
+// `#[cfg(test)] mod tests`.
 mod mctp_ping;
 
 #[cfg(not(target_os = "none"))]
@@ -43,20 +43,20 @@ fn main() -> ! {
         tpm.init(TPM_CRB_MMIO_BASE);
     }
 
-    // Phase 16 — boot-time SP↔EC MCTP ping (D-1, D-5 AMENDED).
-    // Construct the SBSA secure-UART driver (base 0x60030000 per qemu-ec-sp.dts) and ping
-    // the EC's Battery service. Helper logs MCTP_PING_OK or MCTP_PING_FAIL internally.
+    // Boot-time SP↔EC MCTP ping. Construct the SBSA secure-UART driver and
+    // ping the EC's Battery service exactly once. Helper logs MCTP_PING_OK
+    // or MCTP_PING_FAIL internally; the CI harness greps for those markers.
     //
-    // SAFETY: 0x60030000 is mapped device memory in the SP's address space (DTS partition
-    // table, `description = "ec uart"`). No other code in this binary aliases it before
-    // this point. `Pl011Uart::new` performs no register writes — TF-A/QEMU initialized
-    // BAUD/CR earlier. The braced scope drops `uart` before `run_message_loop()`.
+    // SAFETY: `EC_UART_MMIO_BASE` is mapped as a device region in the SP
+    // manifest (qemu-ec-sp.dts, `description = "ec uart"`). No other code in
+    // this binary aliases that region before this point. `RawMmio::new`
+    // only stores the pointer; the first MMIO access happens inside
+    // `send_mctp_ping`. TF-A/QEMU initialized PL011 BAUD/CR earlier — we
+    // intentionally do not touch UARTCR / UARTLCR_H. The braced scope drops
+    // `uart` before `run_message_loop()` so the device handle does not
+    // outlive its (single-shot) use.
     {
-        // SAFETY: 0x60030000 is mapped as a device region in the SP manifest
-        // (qemu-ec-sp.dts, `description = "ec uart"`). No other code aliases
-        // it before this point. `RawMmio::new` only stores the pointer; no
-        // register access happens until the ping helper runs below.
-        let mmio = unsafe { qemu_sp_uart::RawMmio::new(0x60030000) };
+        let mmio = unsafe { qemu_sp_uart::RawMmio::new(qemu_sp_uart::EC_UART_MMIO_BASE) };
         let mut uart = qemu_sp_uart::Pl011Uart::new(mmio);
         crate::mctp_ping::send_mctp_ping(&mut uart, /* battery_id = */ 0);
     }

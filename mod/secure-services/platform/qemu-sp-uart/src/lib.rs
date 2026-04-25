@@ -8,8 +8,10 @@
 //! bound (NOT wall-clock — per Phase 14 D-4). MMIO is fronted by the [`Mmio`]
 //! trait so the bit-twiddling logic is host-testable with a mock backend.
 //!
-//! See `.planning/phases/14-sp-uart-driver-pl011/14-CONTEXT.md` for register
-//! layout, decision rationale, and the QEMU SBSA `serial_hd(1)` mapping.
+//! Register layout follows the standard ARM PL011 spec; the SBSA secure-UART
+//! is mapped at [`EC_UART_MMIO_BASE`] (`0x60030000`) per the SP manifest
+//! (`qemu-ec-sp.dts`). RX uses a bounded busy-wait iteration budget rather
+//! than a wall-clock timeout to keep the driver `no_std` and clock-free.
 
 /// Minimal MMIO abstraction. Real hardware impl uses
 /// `core::ptr::{read,write}_volatile`; host tests use a mock backend.
@@ -71,14 +73,23 @@ impl Mmio for RawMmio {
     }
 }
 
+/// MMIO base address of the SBSA secure-partition's EC UART instance.
+///
+/// Mapped as a device region in the SP manifest (`qemu-ec-sp.dts`,
+/// `description = "ec uart"`). Exposed as `pub` so callers don't need to
+/// hard-code the literal in two places (driver + boot wire-up).
+pub const EC_UART_MMIO_BASE: usize = 0x60030000;
+
 // PL011 register offsets (relative to base, confirmed Phase 12 VERDICT).
-const UARTDR: usize = 0x000;
-const UARTFR: usize = 0x018;
+// `pub` so mock backends in downstream crates can target the same offsets
+// without re-declaring the magic numbers.
+pub const UARTDR: usize = 0x000;
+pub const UARTFR: usize = 0x018;
 // PL011 flag-register bits.
-const FR_RXFE: u32 = 1 << 4; // RX FIFO empty
-const FR_TXFF: u32 = 1 << 5; // TX FIFO full
-// (BUSY bit 3 not currently used — Phase 12 spike showed BUSY-spinning is
-// unnecessary on QEMU.)
+pub const FR_RXFE: u32 = 1 << 4; // RX FIFO empty
+pub const FR_TXFF: u32 = 1 << 5; // TX FIFO full
+// (BUSY bit 3 not currently used — the original ping-pong spike showed
+// BUSY-spinning is unnecessary on QEMU.)
 
 /// PL011 driver errors.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -88,12 +99,12 @@ pub enum Error {
 }
 
 /// Default RX iteration budget. Tuned conservatively to fail well before the
-/// outer `make e2e-test` watchdog (per UD-02). Wall-clock duration varies by
-/// CPU/build profile (Phase 14 D-4 accepts this).
+/// outer `make e2e-test` watchdog. Wall-clock duration varies by CPU and
+/// build profile — this is an iteration count, not a timer.
 ///
-/// **Practical note (Plan 14-02 finding):** on QEMU SBSA this budget exhausts
-/// in milliseconds — far less than the seconds an EC round-trip actually needs.
-/// Callers expecting an SP↔EC reply (e.g. MCTP relay) MUST pass a larger
+/// **Practical note:** on QEMU SBSA this budget exhausts in milliseconds —
+/// far less than the seconds an EC round-trip actually needs. Callers
+/// expecting an SP↔EC reply (e.g. MCTP relay) MUST pass a larger
 /// `max_iters` to [`Pl011Uart::read_byte_timeout`] (`u32::MAX` is a safe
 /// upper bound; it caps at a few seconds of QEMU wall-clock). The default
 /// is appropriate for unit-test "no-byte-arrived" assertions and host fakes.
@@ -106,14 +117,20 @@ pub struct Pl011Uart<M: Mmio> {
 
 impl<M: Mmio> Pl011Uart<M> {
     /// Wrap an MMIO backend. Does NOT touch UARTCR / UARTLCR_H — TF-A and QEMU
-    /// init are assumed (Phase 14 D-4: no BAUD reconfigure).
+    /// init are assumed (no BAUD reconfigure here, by design).
     pub const fn new(mmio: M) -> Self {
         Self { mmio }
     }
 
-    /// Borrow the underlying MMIO backend (test-only convenience).
-    #[cfg(test)]
-    fn mmio(&self) -> &M {
+    /// Borrow the underlying MMIO backend.
+    ///
+    /// Test-only convenience exposed `pub` (with `#[doc(hidden)]`) so unit
+    /// tests in downstream crates can inspect their mock backend after the
+    /// driver has taken ownership of it. Production code MUST NOT depend on
+    /// this method — it bypasses the `&mut`-only register API and exists
+    /// solely so test mocks can read out their TX log / scripted state.
+    #[doc(hidden)]
+    pub fn mmio_for_test(&self) -> &M {
         &self.mmio
     }
 
@@ -157,9 +174,9 @@ impl<M: Mmio> Pl011Uart<M> {
 }
 
 // ---------------------------------------------------------------------------
-// Host-side tests (UD-03 + ROADMAP success criterion #4).
-// `MockMmio` lives entirely under `#[cfg(test)]` — it intentionally does NOT
-// exist in the `aarch64-unknown-none` binary, preserving the no-alloc runtime.
+// Host-side tests. `MockMmio` lives entirely under `#[cfg(test)]` — it
+// intentionally does NOT exist in the `aarch64-unknown-none` binary,
+// preserving the no-alloc runtime.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -235,8 +252,8 @@ mod tests {
         mock.push_fr(0); // third poll: clear → write
         let mut uart = Pl011Uart::new(mock);
         uart.write_byte(0x42);
-        assert_eq!(uart.mmio().dr_tx_log(), vec![0x42]);
-        assert_eq!(uart.mmio().fr_read_count(), 3);
+        assert_eq!(uart.mmio_for_test().dr_tx_log(), vec![0x42]);
+        assert_eq!(uart.mmio_for_test().fr_read_count(), 3);
     }
 
     #[test]
@@ -247,7 +264,7 @@ mod tests {
         mock.push_fr(0); // byte ready
         let mut uart = Pl011Uart::new(mock);
         assert_eq!(uart.read_byte_timeout(10_000), Ok(0xA5));
-        assert_eq!(uart.mmio().fr_read_count(), 3);
+        assert_eq!(uart.mmio_for_test().fr_read_count(), 3);
     }
 
     #[test]
@@ -256,7 +273,7 @@ mod tests {
         let mock = MockMmio::new(FR_RXFE, 0);
         let mut uart = Pl011Uart::new(mock);
         assert_eq!(uart.read_byte_timeout(1_000), Err(Error::Timeout));
-        let n = uart.mmio().fr_read_count();
+        let n = uart.mmio_for_test().fr_read_count();
         assert!(n >= 1_000, "expected >= 1000 polls, got {n}");
         assert!(n <= 1_010, "should bail within budget, got {n}");
     }
@@ -266,7 +283,7 @@ mod tests {
         let mock = MockMmio::new(0, 0);
         let mut uart = Pl011Uart::new(mock);
         uart.write_bytes(b"hi");
-        assert_eq!(uart.mmio().dr_tx_log(), vec![b'h', b'i']);
+        assert_eq!(uart.mmio_for_test().dr_tx_log(), vec![b'h', b'i']);
     }
 
     #[test]
@@ -274,6 +291,6 @@ mod tests {
         let mock = MockMmio::new(FR_RXFE, 0);
         let mut uart = Pl011Uart::new(mock);
         assert_eq!(uart.read_byte_timeout(0), Err(Error::Timeout));
-        assert_eq!(uart.mmio().fr_read_count(), 0);
+        assert_eq!(uart.mmio_for_test().fr_read_count(), 0);
     }
 }

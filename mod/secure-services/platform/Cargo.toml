@@ -39,6 +39,12 @@ ec-service-lib = { path = "../odp-secure-services/ec-service-lib" }
 hafnium = { path = "../odp-secure-services/hafnium" }
 odp-ffa = { path = "../odp-secure-services/odp-ffa" }
 
+[dev-dependencies]
+# Pull in the framer's captured wire-bytes goldens so `mctp_ping::tests` and
+# the framer's own unit tests share a single source-of-truth for the Phase 12
+# TX/RX fixtures (review finding M5 — cross-submodule duplication).
+sp-mctp-framer = { path = "../odp-secure-services/sp-mctp-framer", features = ["test-fixtures"] }
+
 [build-dependencies]
 chrono = "0.4"
 

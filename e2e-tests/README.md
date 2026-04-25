@@ -11,7 +11,7 @@ Secure Partition platform. The two main entrypoints driven from the parent
 
 The `test-serial` target is a thin wrapper around `scripts/test-serial.sh`
 in the parent repo. Run `scripts/test-serial.sh --help` for the full flag
-list, including `--fault-inject` (Phase 17) for triage.
+list, including `--fault-inject` for triage.
 
 ## Failure-mode triage
 
@@ -39,17 +39,22 @@ signature. The discriminator is `e2e-tests/Build/ec-serial-output.log`:
 - **`MCTP_PING_FAIL framer_*` / `decode` / non-timeout reason**
   → SP-side framing bug. **stuck-SP**. EC log is irrelevant.
 
-Note: empirically (Phase 17 captures), if EC is frozen *before* the SP
-finishes early init (e.g. `--fault-inject=ec-silent`), the SP never
-reaches `mctp_ping` at all and the harness watchdog fires first → you
-will see signature (b)/124, NOT (d). To distinguish that case from a
-genuinely stuck SBSA QEMU, check `ec-serial-output.log` per the (b) row.
+Note: empirically, if EC is frozen *before* the SP finishes early init
+(e.g. `--fault-inject=ec-silent`), the SP never reaches `mctp_ping` at
+all and the harness watchdog fires first → you will see signature
+(b)/124, NOT (d). To distinguish that case from a genuinely stuck SBSA
+QEMU, check `ec-serial-output.log` per the (b) row.
+
+Note: `--fault-inject=sbsa-hang` silently overrides both `--sbsa-timeout`
+(set to 2) and `--ec-timeout` (clamped to ≤2 if larger), to keep the
+overall wall-time bounded for the watchdog test. The override is logged
+on stderr at startup.
 
 ### Reproducing each signature with `--fault-inject`
 
-Phase 17 added a `--fault-inject={ec-silent|sp-no-call|sbsa-hang}` flag
-(default OFF). It is plumbed through the `test-serial` Make target via
-the `FAULT_INJECT` variable.
+A `--fault-inject={ec-silent|sp-no-call|sbsa-hang}` flag (default OFF)
+injects a deterministic failure mode for triage. It is plumbed through
+the `test-serial` Make target via the `FAULT_INJECT` variable.
 
 ```bash
 # signature (b)/124 with stuck-EC fingerprint — EC frozen via SIGSTOP,
@@ -64,31 +69,29 @@ HUSKY=0 make -C e2e-tests test-serial FAULT_INJECT=sbsa-hang
 ```
 
 All three injected modes currently surface as variants of signature (b),
-discriminated by exit code N and `ec-serial-output.log` content. This
-matches the empirical capture in `17-01-SUMMARY.md` Appendix A.
+discriminated by exit code N and `ec-serial-output.log` content.
 
-Note (Phase 17 CONTEXT D-1): EC-stuck-pre-boot (signature `c`) cannot be
-injected from the harness without breaking the EC build — deferred to a
-future phase.
+Note: EC-stuck-pre-boot (signature `c`) cannot be injected from the
+harness without breaking the EC build — deferred to a future phase.
 
-### CI baseline wall-time (Phase 17)
+### CI baseline wall-time
 
-Phase-17 baseline: see `.planning/phases/17-ci-gate-failure-modes/17-01-SUMMARY.md`
-(measured against the most recent green `build-test-bios` run on `main`
-at the time Phase 17 closed). Future regressions >2x the baseline flag a
-performance review (CONTEXT D-5).
+Track wall-time of the gating `build-test-bios` job from green runs on
+`main`. Future regressions >2x baseline flag a performance review.
 
 ### Cross-references
 
-- `scripts/test-serial.sh` — signature emitters live at lines 82
-  (`ERROR:`, setup), 231 (`SBSA QEMU exited with code N`), 252
-  (`EC: boot FAILED`), 269 (`MCTP: PING FAILED`), 275
-  (`MCTP: NEITHER MCTP_PING_OK nor MCTP_PING_FAIL seen`). The verbatim
-  strings cited in the triage table above must match what those `echo`
-  lines emit.
-- `.planning/phases/16-ping-pong-end-to-end/` — the Phase 16 ping-pong
-  contract (which `test-serial` enforces).
-- `.planning/phases/17-ci-gate-failure-modes/17-01-SUMMARY.md` — the
-  Phase 17 verification log, including captured fault-injection output.
-  Contains exit codes and verbatim signature lines for each of the three
-  fault-injection modes captured at phase closure.
+- `scripts/test-serial.sh` — signature emitters are tagged with greppable
+  anchor comments. Use `grep '# signature-emitter:' scripts/test-serial.sh`
+  to find them. Anchors:
+  - `pty-raw-enforce` — local-only PTY-raw setup error
+  - `sbsa-qemu-launch` — emits `SBSA QEMU exited with code N` on non-zero exit
+  - `mctp-ping-verify` — emits `MCTP: PING FAILED` / `MCTP: ping OK` /
+    `MCTP: neither MCTP_PING_OK nor MCTP_PING_FAIL seen ...`
+  - `fault-ec-silent`, `fault-sp-no-call` — fault-injection emitters
+  The verbatim strings cited in the triage table above must match what
+  those `echo` lines emit; CI alerting greps them as opaque tokens.
+- See the `mod/secure-services/platform/src/mctp_ping.rs` source for the
+  ping-pong contract enforced by `test-serial`. The `MctpPingError`
+  `Display` impl is the source of truth for the `<reason>` strings in
+  `MCTP_PING_FAIL <reason>`.
