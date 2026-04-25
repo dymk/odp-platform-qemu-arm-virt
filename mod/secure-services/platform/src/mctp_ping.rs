@@ -13,12 +13,17 @@
 use core::fmt;
 
 use qemu_sp_uart::{Error as UartError, Mmio, Pl011Uart};
-use sp_mctp_framer::{decode_battery_response, encode_battery_request};
+use sp_mctp_framer::{decode_response, encode_request};
 
-/// MCTP service id for the Battery service. Used to gate the ACCEPT decision
+/// MCTP service id for the Battery service. Used both as the destination
+/// MCTP endpoint ID for outbound requests and to gate the ACCEPT decision
 /// on the decoded reply — any well-formed frame whose `service_id` differs
 /// from this value is treated as a decode error.
 const BATTERY_SERVICE_ID: u8 = 8;
+
+/// Battery::GetSta message id (matches the `BatteryService::GetSta`
+/// discriminant on the EC side; captured wire byte 12 = 0x0f = 15).
+const BATTERY_GETSTA_MSG_ID: u16 = 15;
 
 /// First-byte RX iteration budget.
 ///
@@ -46,7 +51,7 @@ const NTH_BYTE_BUDGET: u32 = qemu_sp_uart::DEFAULT_RX_TIMEOUT_ITERS;
 
 /// Lifetime-free copy of the framer-decoded fields surfaced in the OK marker.
 ///
-/// We avoid returning `BatteryResponse<'_>` directly because that would
+/// We avoid returning `OdpRelayResponse<'_>` directly because that would
 /// borrow from the caller's stack RX buffer, complicating composition with
 /// `log::info!` argument capture. The three fields below are the full
 /// contract emitted by the OK log line.
@@ -65,11 +70,11 @@ pub enum MctpPingError {
     /// `Pl011Uart::read_byte_timeout` exhausted its iteration budget without
     /// seeing the next expected byte.
     Timeout,
-    /// `sp_mctp_framer::encode_battery_request` rejected the request.
+    /// `sp_mctp_framer::encode_request` rejected the request.
     /// Typically a buffer-sizing or mctp-rs version-drift bug, not a wire
     /// fault.
     FramerEncode,
-    /// `sp_mctp_framer::decode_battery_response` rejected the reply, OR the
+    /// `sp_mctp_framer::decode_response` rejected the reply, OR the
     /// reply decoded cleanly but did not target the Battery service.
     FramerDecode,
 }
@@ -108,7 +113,8 @@ fn try_send_mctp_ping<M: Mmio>(
 ) -> Result<DecodedFields, MctpPingError> {
     // 1. Encode the GetSta request.
     let mut tx = [0u8; 32];
-    let n = encode_battery_request(&mut tx, battery_id).map_err(|_| MctpPingError::FramerEncode)?;
+    let n = encode_request(&mut tx, BATTERY_SERVICE_ID, BATTERY_GETSTA_MSG_ID, &[battery_id])
+        .map_err(|_| MctpPingError::FramerEncode)?;
 
     // 2. Transmit (cannot fail — Pl011Uart::write_bytes returns ()).
     uart.write_bytes(&tx[..n]);
@@ -144,7 +150,7 @@ fn try_send_mctp_ping<M: Mmio>(
     // 6. Decode and gate on `service_id == BATTERY_SERVICE_ID` AND
     //    `is_request == false` (we expect a response, not an echoed
     //    request). Either mismatch surfaces as a decode error.
-    let resp = decode_battery_response(&rx[..needed]).map_err(|_| MctpPingError::FramerDecode)?;
+    let resp = decode_response(&rx[..needed]).map_err(|_| MctpPingError::FramerDecode)?;
     if resp.is_request {
         return Err(MctpPingError::FramerDecode);
     }
@@ -259,7 +265,7 @@ mod tests {
     fn pathological_byte_count_returns_decode_error_and_does_not_swallow_tx() {
         // 13 bytes of 0xFF: byte_count = 0xFF → needed = 4 + 255 = 259, our
         // internal rx buffer is 32 → triggers the explicit pathological-
-        // length guard BEFORE `decode_battery_response` is called. The TX
+        // length guard BEFORE `decode_response` is called. The TX
         // log must STILL contain the encoded request — a regression where
         // the decode-failure path also dropped TX would be caught here.
         let garbage = [0xFFu8; 13];
