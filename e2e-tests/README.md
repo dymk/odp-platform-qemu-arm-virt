@@ -80,9 +80,12 @@ performance review (CONTEXT D-5).
 
 ### Cross-references
 
-- `scripts/test-serial.sh` — signature emitters live around lines ~173,
-  194, 211, 215, 217 of the script. The verbatim strings cited in the
-  triage table above must match what those `echo` lines emit.
+- `scripts/test-serial.sh` — signature emitters live at lines 82
+  (`ERROR:`, setup), 231 (`SBSA QEMU exited with code N`), 252
+  (`EC: boot FAILED`), 269 (`MCTP: PING FAILED`), 275
+  (`MCTP: NEITHER MCTP_PING_OK nor MCTP_PING_FAIL seen`). The verbatim
+  strings cited in the triage table above must match what those `echo`
+  lines emit.
 - `.planning/phases/16-ping-pong-end-to-end/` — the Phase 16 ping-pong
   contract (which `test-serial` enforces).
 - `.planning/phases/17-ci-gate-failure-modes/17-01-SUMMARY.md` — the
