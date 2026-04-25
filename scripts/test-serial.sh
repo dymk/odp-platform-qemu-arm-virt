@@ -17,6 +17,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib/swtpm.sh"
 # shellcheck source=lib/ec-qemu.sh
 source "$SCRIPT_DIR/lib/ec-qemu.sh"
+# Phase 16 (PP-04): PTY raw-mode helper — D-8 AMENDED canonical location.
+# shellcheck source=lib/pty-raw.sh
+source "$SCRIPT_DIR/lib/pty-raw.sh"
 
 usage() {
     cat <<'EOF'
@@ -143,6 +146,11 @@ start_ec_qemu "$EC_ELF" "$EC_OUT_LOG" "$EC_ERR_LOG" "$EC_SERIAL_LOG" "$EC_TIMEOU
 PTY=$(discover_ec_pty "$EC_OUT_LOG" "$EC_ERR_LOG") || exit 1
 echo "EC PTY: $PTY — launching SBSA QEMU"
 
+# Phase 16 / PP-04 — assert PTY is in raw mode BEFORE SBSA QEMU opens it.
+# Prevents the kernel TTY line discipline from mangling MCTP framing bytes
+# (0x7E flag, 0x7D escape, control codes). See scripts/lib/pty-raw.sh.
+assert_pty_raw "$PTY" || { echo "FATAL: cannot put $PTY in raw mode" >&2; exit 1; }
+
 # 3. SBSA QEMU
 SBSA_EXIT=0
 timeout "$SBSA_TIMEOUT" \
@@ -191,6 +199,23 @@ if [ -s "$SBSA_SERIAL_LOG" ]; then
     echo "SBSA: produced serial output (PTY connected)"
 else
     echo "SBSA: WARNING — no serial output captured (may be OK if boot is slow)"
+fi
+
+# Phase 16 / PP-02 — MCTP ping-pong assertion.
+# PASS condition: SBSA serial log contains MCTP_PING_OK and NOT MCTP_PING_FAIL.
+# FAIL conditions: MCTP_PING_FAIL line OR neither marker present.
+# Note (D-4 / PP-03): no log-grep readiness handshake here — SP-side timeout (which
+# surfaces as MCTP_PING_FAIL timeout) is the cold-start failure-detection mechanism.
+if grep -q "MCTP_PING_FAIL" "$SBSA_SERIAL_LOG" 2>/dev/null; then
+    fail_line=$(grep "MCTP_PING_FAIL" "$SBSA_SERIAL_LOG" | head -1)
+    echo "MCTP: PING FAILED -- $fail_line"
+    PASS=false
+elif grep -q "MCTP_PING_OK" "$SBSA_SERIAL_LOG" 2>/dev/null; then
+    ok_line=$(grep "MCTP_PING_OK" "$SBSA_SERIAL_LOG" | head -1)
+    echo "MCTP: ping OK -- $ok_line"
+else
+    echo "MCTP: NEITHER MCTP_PING_OK nor MCTP_PING_FAIL seen in $SBSA_SERIAL_LOG"
+    PASS=false
 fi
 
 if "$PASS"; then
