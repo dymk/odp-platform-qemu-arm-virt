@@ -31,6 +31,11 @@ Usage: test-serial.sh --ec-elf PATH --bios-fv-dir DIR --build-dir DIR \
   --build-dir     Build/ directory (logs and swtpm-state live here)
   --ec-timeout    Seconds for EC QEMU run (default: 30)
   --sbsa-timeout  Seconds for SBSA QEMU run (default: 60)
+  --fault-inject MODE
+                  (DEBUG/CI-triage only) inject a deterministic failure:
+                  ec-silent | sp-no-call | sbsa-hang. Default: off (no
+                  behavior change). See e2e-tests/README.md
+                  "Failure-mode triage".
   --              Everything after this is forwarded verbatim to
                   qemu-system-aarch64 as the SBSA common args (machine,
                   cpu, mem, smbios, etc.)
@@ -50,6 +55,7 @@ BIOS_FV_DIR=""
 BUILD_DIR=""
 EC_TIMEOUT=30
 SBSA_TIMEOUT=60
+FAULT_INJECT=""
 
 require_arg() {
     # require_arg <flag-name> <value-or-empty>
@@ -63,6 +69,8 @@ while [ $# -gt 0 ]; do
         --build-dir)    require_arg "$1" "${2-}"; BUILD_DIR="$2"; shift 2 ;;
         --ec-timeout)   require_arg "$1" "${2-}"; EC_TIMEOUT="$2"; shift 2 ;;
         --sbsa-timeout) require_arg "$1" "${2-}"; SBSA_TIMEOUT="$2"; shift 2 ;;
+        --fault-inject) require_arg "$1" "${2-}"; FAULT_INJECT="$2"; shift 2 ;;
+        --fault-inject=*) FAULT_INJECT="${1#*=}"; shift ;;
         -h|--help)      usage 0 ;;
         --)             shift; break ;;
         *)              echo "Unknown arg: $1" >&2; usage 1 ;;
@@ -87,6 +95,19 @@ case "$SBSA_TIMEOUT" in
     ''|*[!0-9]*|0) echo "ERROR: --sbsa-timeout must be a positive integer (got: $SBSA_TIMEOUT)" >&2; exit 1 ;;
 esac
 
+# Phase 17 — fault-injection allowlist + sbsa-hang SBSA_TIMEOUT override.
+# Allowlist validation MUST come AFTER the positive-int validation above so
+# the override of `2` for sbsa-hang is set on a variable already validated.
+case "$FAULT_INJECT" in
+    ''|ec-silent|sp-no-call|sbsa-hang) ;;
+    *) echo "ERROR: --fault-inject must be one of: ec-silent, sp-no-call, sbsa-hang (got: $FAULT_INJECT)" >&2; exit 1 ;;
+esac
+
+if [ "$FAULT_INJECT" = "sbsa-hang" ]; then
+    SBSA_TIMEOUT=2
+    echo "FAULT_INJECT=sbsa-hang: SBSA_TIMEOUT overridden to 2 (expect timeout(1) exit 124)" >&2
+fi
+
 SWTPM_STATE="$BUILD_DIR/swtpm-state"
 SWTPM_SOCK="$SWTPM_STATE/swtpm-sock"
 SWTPM_LOG="$BUILD_DIR/swtpm.log"
@@ -97,6 +118,7 @@ SBSA_SERIAL_LOG="$BUILD_DIR/sbsa-serial-output.log"
 
 EC_PID=""
 SWTPM_PID=""
+FAULT_RACE_PID=""
 
 # Tear down the EC session (no-op if EC_PID is unset).
 #
@@ -109,6 +131,10 @@ SWTPM_PID=""
 # is reached, then `kill -- -$EC_PID` as a belt-and-braces fallback.
 kill_ec_session() {
     [ -n "$EC_PID" ] || return 0
+    # Phase 17: send SIGCONT first in case --fault-inject=ec-silent left the
+    # session SIGSTOPed — otherwise the SIGTERM below queues forever and the
+    # `wait` at the end hangs.
+    pkill -CONT -s "$EC_PID" 2>/dev/null
     pkill -TERM -s "$EC_PID" 2>/dev/null
     kill -- "-$EC_PID" 2>/dev/null
     wait "$EC_PID" 2>/dev/null
@@ -123,6 +149,11 @@ cleanup() {
     if [ -n "$SWTPM_PID" ]; then
         kill "$SWTPM_PID" 2>/dev/null
         wait "$SWTPM_PID" 2>/dev/null
+    fi
+    # shellcheck disable=SC2317
+    if [ -n "$FAULT_RACE_PID" ]; then
+        kill "$FAULT_RACE_PID" 2>/dev/null
+        wait "$FAULT_RACE_PID" 2>/dev/null
     fi
     # shellcheck disable=SC2317
     true
@@ -151,8 +182,35 @@ echo "EC PTY: $PTY — launching SBSA QEMU"
 # (0x7E flag, 0x7D escape, control codes). See scripts/lib/pty-raw.sh.
 assert_pty_raw "$PTY" || { echo "FATAL: cannot put $PTY in raw mode" >&2; exit 1; }
 
+# FAULT_INJECT=ec-silent — freeze the EC after PTY is up so SP-side MCTP
+# timeout fires (signature d). Use SIGSTOP on the session leader; if pgrp
+# routing leaks (see kill_ec_session comment above), widen via
+# `pkill -STOP -s "$EC_PID"` per Phase-17 deviation_policy #1.
+if [ "$FAULT_INJECT" = "ec-silent" ]; then
+    echo "FAULT_INJECT=ec-silent: SIGSTOP'ing EC session led by EC_PID=$EC_PID" >&2
+    # Per Phase 17 deviation_policy #1: SIGSTOP on the leader alone leaks
+    # because the timeout/qemu/tee/defmt-print stages each get their own
+    # process group inside the session (job control quirk — see comment on
+    # kill_ec_session above). Use `pkill -STOP -s` to STOP every process in
+    # the session.
+    pkill -STOP -s "$EC_PID" 2>/dev/null \
+        || echo "WARN: pkill -STOP -s $EC_PID failed (session may have already exited)" >&2
+fi
+
 # 3. SBSA QEMU
 SBSA_EXIT=0
+
+# FAULT_INJECT=sp-no-call — race-kill qemu-system-aarch64 ~2s into boot,
+# well before SP reaches send_mctp_ping. Helper PID stashed for cleanup
+# trap. `pkill -P $$` restricts to children of THIS shell only.
+if [ "$FAULT_INJECT" = "sp-no-call" ]; then
+    echo "FAULT_INJECT=sp-no-call: race-killing qemu-system-aarch64 in 2s" >&2
+    # `pkill -f` matches against the full command line (not the 15-char
+    # truncated comm). `-P $$` restricts to children of THIS shell only.
+    ( sleep 2 && pkill -P $$ -9 -f qemu-system-aarch64 ) &
+    FAULT_RACE_PID=$!
+fi
+
 timeout "$SBSA_TIMEOUT" \
     qemu-system-aarch64 \
         "$@" \

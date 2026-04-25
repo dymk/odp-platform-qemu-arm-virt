@@ -28,6 +28,12 @@ QEMU_TIMEOUT ?= 180
 EC_SERIAL_TIMEOUT  ?= 30
 SBSA_SERIAL_TIMEOUT ?= 60
 
+# Optional fault-injection for triage / CI-signature verification.
+# Empty (default) → no flag forwarded → identical to pre-Phase-17
+# invocation. Set to one of: ec-silent | sp-no-call | sbsa-hang.
+# See e2e-tests/README.md "Failure-mode triage".
+FAULT_INJECT ?=
+
 # Virtual drive directory for UEFI Shell to find test EFI binaries
 VDRIVE_DIR := Build/vdrive
 
@@ -121,6 +127,7 @@ test-serial: | builder-image
 		--build-dir e2e-tests/Build \
 		--ec-timeout $(EC_SERIAL_TIMEOUT) \
 		--sbsa-timeout $(SBSA_SERIAL_TIMEOUT) \
+		$(if $(FAULT_INJECT),--fault-inject=$(FAULT_INJECT)) \
 		-- $(QEMU_COMMON_ARGS)
 	$(call ENDGROUP)
 
