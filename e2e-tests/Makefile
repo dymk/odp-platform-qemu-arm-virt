@@ -13,6 +13,7 @@ include ../Common.mk
 TARGET_DIR := target/aarch64-unknown-uefi/release
 THERMAL_EFI := $(TARGET_DIR)/thermal.efi
 TPM_EFI := $(TARGET_DIR)/tpm.efi
+EC_BATTERY_EFI := $(TARGET_DIR)/ec-battery.efi
 
 # Timeout for QEMU execution (seconds)
 QEMU_TIMEOUT ?= 180
@@ -26,6 +27,10 @@ SBSA_SERIAL_TIMEOUT ?= 60
 
 # Virtual drive directory for UEFI Shell to find test EFI binaries
 VDRIVE_DIR := Build/vdrive
+# Phase 37: SEPARATE vdrive for the MCTP E2E test (ec-battery.efi +
+# startup-mctp.nsh renamed to startup.nsh on copy). Existing VDRIVE_DIR
+# above is untouched so `make test` continues to boot thermal+tpm.
+VDRIVE_MCTP_DIR := Build/vdrive-mctp
 
 # Tee QEMU serial output to stdout (auto-enabled in CI). Passed through to
 # scripts/test-e2e.sh, which owns the actual -serial / tee plumbing.
@@ -115,6 +120,38 @@ test-serial: | builder-image
 		--ec-elf $(EC_BINARY) \
 		--bios-fv-dir $(BIOS_FV_DIR) \
 		--build-dir e2e-tests/Build \
+		--ec-timeout $(EC_SERIAL_TIMEOUT) \
+		--sbsa-timeout $(SBSA_SERIAL_TIMEOUT) \
+		-- $(QEMU_COMMON_ARGS)
+	$(call ENDGROUP)
+
+# ------------------------------------------------------------
+# MCTP E2E Test (Phase 37 — UEFI ↔ FFA ↔ SP ↔ MCTP/serial ↔ EC)
+# ------------------------------------------------------------
+# Builds a SEPARATE vdrive containing ec-battery.efi + startup-mctp.nsh
+# (renamed to startup.nsh on copy), then invokes scripts/test-e2e-mctp.sh
+# which combines test-serial.sh's dual-QEMU + PTY-bridge with test-e2e.sh's
+# vdrive + UEFI shell autoload. Existing `test:` and `test-serial:` targets
+# are untouched.
+#
+# Caller (top-level Makefile) is responsible for ensuring `ec` and `uefi`
+# are built; this target only runs the MCTP check.
+$(VDRIVE_MCTP_DIR): build $(EC_BATTERY_EFI) startup-mctp.nsh
+	rm -rf $(VDRIVE_MCTP_DIR)
+	mkdir -p $(VDRIVE_MCTP_DIR)
+	cp $(EC_BATTERY_EFI) $(VDRIVE_MCTP_DIR)/
+	cp startup-mctp.nsh $(VDRIVE_MCTP_DIR)/startup.nsh
+
+.PHONY: test-mctp
+test-mctp: $(VDRIVE_MCTP_DIR)
+	@mkdir -p Build
+	@echo "=== Running MCTP E2E test (EC timeout=$(EC_SERIAL_TIMEOUT)s, SBSA timeout=$(SBSA_SERIAL_TIMEOUT)s) ==="
+	$(call GROUP,MCTP E2E test)
+	@$(DC_RUN) -- scripts/test-e2e-mctp.sh \
+		--ec-elf $(EC_BINARY) \
+		--bios-fv-dir $(BIOS_FV_DIR) \
+		--build-dir e2e-tests/Build \
+		--vdrive-dir e2e-tests/$(VDRIVE_MCTP_DIR) \
 		--ec-timeout $(EC_SERIAL_TIMEOUT) \
 		--sbsa-timeout $(SBSA_SERIAL_TIMEOUT) \
 		-- $(QEMU_COMMON_ARGS)

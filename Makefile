@@ -54,10 +54,22 @@ e2e-test: ec uefi
 	$(MAKE) -C e2e-tests test
 
 # ------------------------------------------------------------
+# Phase 37: MCTP E2E test (UEFI ↔ FFA ↔ SP ↔ MCTP/serial ↔ EC)
+# ------------------------------------------------------------
+# Builds ec + uefi (existing deps) then invokes the e2e-tests test-mctp
+# sub-target which builds Build/vdrive-mctp/ and runs
+# scripts/test-e2e-mctp.sh. Uses the default `secure-services` build
+# (no test-bypass flags) so EcBattery wiring from Phase 37 c2 is exercised.
+# Existing `e2e-test:` target above is UNCHANGED.
+e2e-test-mctp: ec uefi
+	$(MAKE) -C mod secure-services
+	$(MAKE) -C e2e-tests test-mctp
+
+# ------------------------------------------------------------
 # Clean everything
 # ------------------------------------------------------------
 clean:
 	$(MAKE) -C mod clean
 	$(MAKE) -C e2e-tests clean
 
-.PHONY: all mod secure-services secure-services-test uefi ec run e2e-test clean
+.PHONY: all mod secure-services secure-services-test uefi ec run e2e-test e2e-test-mctp clean
