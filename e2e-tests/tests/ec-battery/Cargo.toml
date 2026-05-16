@@ -1,0 +1,25 @@
+# Cargo package manifest for the ec-battery E2E test application.
+#
+# Calls the SP-side EcBattery FFA service (UUID
+# 25cb5207-ac36-427d-aaef-3aa78877d27e), which round-trips a GetBst
+# request over MCTP-via-PL011 to the EC SP. Emits the
+# `EC_MCTP_OK service_id=8 msg_id=GetBst battery_status=<hex>` marker
+# on PASS for the test-e2e-mctp.sh harness to grep.
+#
+# SPDX-License-Identifier: MIT
+#
+
+[package]
+name = "ec-battery"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ffa = { path = "../../ffa" }
+test-support = { path = "../../test-support" }
+uefi = { version = "0.34", features = [
+    "panic_handler",
+    "alloc",
+    "global_allocator",
+] }
+log = { version = "0.4", default-features = false }

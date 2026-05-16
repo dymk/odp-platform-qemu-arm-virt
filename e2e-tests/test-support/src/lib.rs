@@ -15,6 +15,14 @@ use uuid::Uuid;
 /// also claims the TPM UUID. Both services run in the same EC SP.
 pub const THERMAL_UUID: Uuid = uuid::uuid!("31f56da7-593c-4d72-a4b3-8fc7171ac073");
 
+/// EC Battery service UUID: 25cb5207-ac36-427d-aaef-3aa78877d27e (UUID_EC_SVC_BATTERY).
+///
+/// Used by the `ec-battery` test app to call the SP-side `EcBattery` FFA
+/// service (Phase 36) which round-trips a `GetBst` request over
+/// MCTP-via-PL011 to the EC SP. The SP partition is the same one served
+/// under `THERMAL_UUID` — FFA dispatch is by UUID inside `MessageHandler`.
+pub const BATTERY_UUID: Uuid = uuid::uuid!("25cb5207-ac36-427d-aaef-3aa78877d27e");
+
 pub const FFA_MSG_SEND_DIRECT_REQ2: u64 = 0xC400008D;
 pub const FFA_MSG_SEND_DIRECT_RESP2: u64 = 0xC400008E;
 const FFA_INTERRUPT: u64 = 0x84000062;
