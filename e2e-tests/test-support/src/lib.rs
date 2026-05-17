@@ -23,6 +23,23 @@ pub const THERMAL_UUID: Uuid = uuid::uuid!("31f56da7-593c-4d72-a4b3-8fc7171ac073
 /// under `THERMAL_UUID` — FFA dispatch is by UUID inside `MessageHandler`.
 pub const BATTERY_UUID: Uuid = uuid::uuid!("25cb5207-ac36-427d-aaef-3aa78877d27e");
 
+/// Contract-locked PASS marker prefix emitted by the `ec-battery` test app
+/// when the EC's MCTP-via-serial GetBst round-trip succeeds. Grep'd by
+/// `scripts/test-e2e-mctp.sh` (which extracts this string from this source
+/// file via `sed` to prevent drift). The full emitted log line is:
+///
+/// ```text
+///   <prefix> battery_status=<32-hex>
+/// ```
+///
+/// where `<prefix>` is exactly this constant and `<32-hex>` is the 16-byte
+/// BST response rendered as a contiguous lowercase hex string.
+///
+/// **Do not change this string without also updating the harness's
+/// extraction regex** (`scripts/test-e2e-mctp.sh` line `MARKER=$(sed -n
+/// 's/^pub const EC_MCTP_OK_MARKER_PREFIX: &str = "\(.*\)";$/\1/p' ...)`).
+pub const EC_MCTP_OK_MARKER_PREFIX: &str = "EC_MCTP_OK service_id=8 msg_id=GetBst";
+
 pub const FFA_MSG_SEND_DIRECT_REQ2: u64 = 0xC400008D;
 pub const FFA_MSG_SEND_DIRECT_RESP2: u64 = 0xC400008E;
 const FFA_INTERRUPT: u64 = 0x84000062;

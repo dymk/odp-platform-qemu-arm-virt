@@ -38,7 +38,10 @@ extern crate alloc;
 
 use core::fmt::Write;
 use ffa::DirectMessagePayload;
-use test_support::{response_payload, run_tests, send_direct_req2, TestResults, BATTERY_UUID};
+use test_support::{
+    response_payload, run_tests, send_direct_req2, TestResults, BATTERY_UUID,
+    EC_MCTP_OK_MARKER_PREFIX,
+};
 use uefi::prelude::*;
 
 /// Expected length of the SP-side EcBattery BST response payload (4 LE u32).
@@ -91,11 +94,13 @@ fn test_ec_battery_get_bst(results: &mut TestResults, our_id: u16, ec_id: u16) {
         return;
     }
 
-    // Marker — contract-locked prefix (HARNESS-02, D-37-02). Harness
-    // greps `EC_MCTP_OK service_id=8 msg_id=GetBst` via `grep -F`; the
-    // `battery_status=<hex>` suffix is informational/diagnostic.
+    // Marker — the prefix is the single source of truth at
+    // `test_support::EC_MCTP_OK_MARKER_PREFIX`; the harness extracts it
+    // from that file at run-time. The `battery_status=<hex>` suffix is
+    // informational / diagnostic.
     log::info!(
-        "EC_MCTP_OK service_id=8 msg_id=GetBst battery_status={}",
+        "{} battery_status={}",
+        EC_MCTP_OK_MARKER_PREFIX,
         fmt_hex(&body)
     );
     results.pass("ec_battery_get_bst");

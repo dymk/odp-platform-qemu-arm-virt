@@ -28,11 +28,17 @@ source "$SCRIPT_DIR/lib/ec-qemu.sh"
 # shellcheck source=lib/dual-qemu-harness.sh
 source "$SCRIPT_DIR/lib/dual-qemu-harness.sh"
 
-# Contract-locked marker prefix. The ec-battery.efi test app emits the
-# full marker as:
-#   EC_MCTP_OK service_id=8 msg_id=GetBst battery_status=<hex>
-# We grep the fixed prefix via `grep -F` (no regex).
-MARKER='EC_MCTP_OK service_id=8 msg_id=GetBst'
+# Contract-locked PASS marker prefix. Single source of truth:
+#   e2e-tests/test-support/src/lib.rs::EC_MCTP_OK_MARKER_PREFIX
+# Extract at run time via sed so the script and the test EFI can never
+# drift. The full emitted log line is `<prefix> battery_status=<hex>`.
+MARKER_SRC="$SCRIPT_DIR/../e2e-tests/test-support/src/lib.rs"
+MARKER=$(sed -n 's/^pub const EC_MCTP_OK_MARKER_PREFIX: &str = "\(.*\)";$/\1/p' "$MARKER_SRC")
+if [ -z "$MARKER" ]; then
+    echo "ERROR: failed to extract EC_MCTP_OK_MARKER_PREFIX from $MARKER_SRC" >&2
+    echo "       (did the const declaration change shape?)" >&2
+    exit 1
+fi
 
 usage() {
     cat <<'EOF'
