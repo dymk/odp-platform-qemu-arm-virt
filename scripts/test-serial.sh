@@ -4,7 +4,11 @@
 # SPDX-License-Identifier: MIT
 #
 # Owns the long-lived child processes (swtpm + EC QEMU + SBSA QEMU),
-# sets up the cleanup trap, and performs post-run verification.
+# sets up the cleanup trap, and performs post-run verification. Most of
+# the orchestration logic lives in lib/dual-qemu-harness.sh; this script
+# is the thin wrapper that parses args and defines the verification
+# (grep for the EC boot string in EC_SERIAL_LOG, plus a non-empty check
+# on SBSA_SERIAL_LOG).
 #
 # Run `test-serial.sh --help` for usage. Must be executed inside the
 # odp-platform-qemu-sbsa devcontainer (requires swtpm, qemu-system-riscv32,
@@ -19,6 +23,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib/swtpm.sh"
 # shellcheck source=lib/ec-qemu.sh
 source "$SCRIPT_DIR/lib/ec-qemu.sh"
+# shellcheck source=lib/dual-qemu-harness.sh
+source "$SCRIPT_DIR/lib/dual-qemu-harness.sh"
 
 usage() {
     cat <<'EOF'
@@ -50,18 +56,13 @@ BUILD_DIR=""
 EC_TIMEOUT=30
 SBSA_TIMEOUT=60
 
-require_arg() {
-    # require_arg <flag-name> <value-or-empty>
-    [ -n "$2" ] || { echo "ERROR: $1 requires a value" >&2; exit 1; }
-}
-
 while [ $# -gt 0 ]; do
     case "$1" in
-        --ec-elf)       require_arg "$1" "${2-}"; EC_ELF="$2"; shift 2 ;;
-        --bios-fv-dir)  require_arg "$1" "${2-}"; BIOS_FV_DIR="$2"; shift 2 ;;
-        --build-dir)    require_arg "$1" "${2-}"; BUILD_DIR="$2"; shift 2 ;;
-        --ec-timeout)   require_arg "$1" "${2-}"; EC_TIMEOUT="$2"; shift 2 ;;
-        --sbsa-timeout) require_arg "$1" "${2-}"; SBSA_TIMEOUT="$2"; shift 2 ;;
+        --ec-elf)       harness_require_arg "$1" "${2-}"; EC_ELF="$2"; shift 2 ;;
+        --bios-fv-dir)  harness_require_arg "$1" "${2-}"; BIOS_FV_DIR="$2"; shift 2 ;;
+        --build-dir)    harness_require_arg "$1" "${2-}"; BUILD_DIR="$2"; shift 2 ;;
+        --ec-timeout)   harness_require_arg "$1" "${2-}"; EC_TIMEOUT="$2"; shift 2 ;;
+        --sbsa-timeout) harness_require_arg "$1" "${2-}"; SBSA_TIMEOUT="$2"; shift 2 ;;
         -h|--help)      usage 0 ;;
         --)             shift; break ;;
         *)              echo "Unknown arg: $1" >&2; usage 1 ;;
@@ -74,110 +75,30 @@ if [ -z "$EC_ELF" ] || [ -z "$BIOS_FV_DIR" ] || [ -z "$BUILD_DIR" ]; then
     usage 1
 fi
 
-# Validate timeouts at parse time. start_ec_qemu interpolates $timeout_s into
-# an inner `bash -c` string (via setsid), so non-numeric input would risk
-# command injection or an empty-`timeout` syntax error inside the inner shell.
-# The library trusts its caller; the orchestrator is the right place to gate.
-# Reject empty, non-digit, and zero in one pattern.
-case "$EC_TIMEOUT" in
-    ''|*[!0-9]*|0) echo "ERROR: --ec-timeout must be a positive integer (got: $EC_TIMEOUT)" >&2; exit 1 ;;
-esac
-case "$SBSA_TIMEOUT" in
-    ''|*[!0-9]*|0) echo "ERROR: --sbsa-timeout must be a positive integer (got: $SBSA_TIMEOUT)" >&2; exit 1 ;;
-esac
+harness_validate_timeouts
 
-SWTPM_STATE="$BUILD_DIR/swtpm-state"
-SWTPM_SOCK="$SWTPM_STATE/swtpm-sock"
-SWTPM_LOG="$BUILD_DIR/swtpm.log"
-EC_OUT_LOG="$BUILD_DIR/ec-qemu-stdout.log"
-EC_ERR_LOG="$BUILD_DIR/ec-qemu-stderr.log"
-EC_SERIAL_LOG="$BUILD_DIR/ec-serial-output.log"
-SBSA_SERIAL_LOG="$BUILD_DIR/sbsa-serial-output.log"
+# Mount the test-serial vdrive (existing behaviour; the FFA-only flow uses
+# this drive for the original startup.nsh).
+EXTRA_QEMU_ARGS=( -drive "file=fat:rw:test-serial-vdrive,format=raw,media=disk" )
 
-EC_PID=""
-SWTPM_PID=""
-
-# Tear down the EC session (no-op if EC_PID is unset).
-#
-# EC_PID is the session leader of a session created by `setsid` (in
-# ec-qemu.sh). Bash auto-enables job control for session-leader children,
-# which puts each pipeline stage (timeout/tee/defmt-print) in its OWN
-# process group inside the session — so a single `kill -- -$EC_PID` only
-# signals the leader's own pgrp and leaks `timeout` + `qemu-system-riscv32`.
-# Signal the whole session via `pkill -s` so every descendant process group
-# is reached, then `kill -- -$EC_PID` as a belt-and-braces fallback.
-kill_ec_session() {
-    [ -n "$EC_PID" ] || return 0
-    pkill -TERM -s "$EC_PID" 2>/dev/null
-    kill -- "-$EC_PID" 2>/dev/null
-    wait "$EC_PID" 2>/dev/null
-}
-
-# shellcheck disable=SC2329  # invoked via `trap ... EXIT` below
-cleanup() {
-    # SC2317: invoked via `trap ... EXIT`, not statically reachable.
-    # shellcheck disable=SC2317
-    kill_ec_session
-    # shellcheck disable=SC2317
-    if [ -n "$SWTPM_PID" ]; then
-        kill "$SWTPM_PID" 2>/dev/null
-        wait "$SWTPM_PID" 2>/dev/null
-    fi
-    # shellcheck disable=SC2317
-    true
-}
-trap cleanup EXIT
-
-mkdir -p "$BUILD_DIR" "$SWTPM_STATE"
-rm -f "$EC_OUT_LOG" "$EC_ERR_LOG" "$EC_SERIAL_LOG" "$SBSA_SERIAL_LOG" "$SWTPM_SOCK"
-
-# 1. swtpm
-start_swtpm "$SWTPM_STATE" "$SWTPM_SOCK" "$SWTPM_LOG"
-wait_for_swtpm_socket "$SWTPM_SOCK" || {
-    echo "--- swtpm log ($SWTPM_LOG) ---" >&2
-    cat "$SWTPM_LOG" >&2 2>/dev/null || echo "(empty or missing)" >&2
-    echo "--- end swtpm log ---" >&2
-    exit 1
-}
-
-# 2. EC QEMU + PTY discovery
-start_ec_qemu "$EC_ELF" "$EC_OUT_LOG" "$EC_ERR_LOG" "$EC_SERIAL_LOG" "$EC_TIMEOUT"
-PTY=$(discover_ec_pty "$EC_OUT_LOG" "$EC_ERR_LOG") || exit 1
+harness_setup_paths
+harness_install_cleanup
+harness_start_services
 echo "EC PTY: $PTY — launching SBSA QEMU"
 
-# 3. SBSA QEMU
-SBSA_EXIT=0
-timeout "$SBSA_TIMEOUT" \
-    qemu-system-aarch64 \
-        "$@" \
-        -drive "if=pflash,format=raw,unit=0,file=$BIOS_FV_DIR/SECURE_FLASH0.fd" \
-        -drive "if=pflash,format=raw,unit=1,file=$BIOS_FV_DIR/QEMU_EFI.fd,readonly=on" \
-        -chardev "socket,id=chrtpm,path=$SWTPM_SOCK" \
-        -tpmdev "emulator,id=tpm0,chardev=chrtpm" \
-        -chardev "serial,id=ec-link,path=$PTY" \
-        -serial "file:$SBSA_SERIAL_LOG" \
-        -serial "chardev:ec-link" \
-        -drive "file=fat:rw:test-serial-vdrive,format=raw,media=disk" \
-        -display none \
-        -no-reboot \
-    || SBSA_EXIT=$?
+harness_run_sbsa "$@"
 
-# 4. SBSA failure short-circuits before verification (matches original recipe).
-if [ "$SBSA_EXIT" -ne 0 ]; then
-    echo "SBSA QEMU exited with code $SBSA_EXIT" >&2
-    exit "$SBSA_EXIT"
+# SBSA failure short-circuits before verification (matches original recipe).
+if [ "$HARNESS_SBSA_EXIT" -ne 0 ]; then
+    echo "SBSA QEMU exited with code $HARNESS_SBSA_EXIT" >&2
+    exit "$HARNESS_SBSA_EXIT"
 fi
 
-# 5. Tear down the EC pipeline BEFORE verification so that defmt-print's
-# block-buffered stdout (redirected to a regular file) is fully flushed to
-# $EC_SERIAL_LOG before we grep it. The original Makefile recipe got this
-# for free: verification ran in a separate shell after the bash -lc subshell's
-# EXIT trap had already reaped EC. Clear EC_PID so the EXIT trap below
-# doesn't try to tear it down a second time.
-kill_ec_session
-EC_PID=""
+# Flush the EC pipeline before grepping EC_SERIAL_LOG (the original
+# Makefile recipe got this for free via subshell EXIT-trap ordering).
+harness_shutdown_ec
 
-# 6. Verification (only on SBSA success).
+# Verification (only on SBSA success).
 PASS=true
 if grep -q "Starting uart service" "$EC_SERIAL_LOG" 2>/dev/null; then
     echo "EC: boot successful (PTY serial backend)"
