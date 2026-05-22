@@ -21,6 +21,10 @@ fn main() {
 /// Must match the device-region mapping in the SP manifest (`qemu-ec-sp.dts`).
 #[cfg(target_os = "none")]
 const TPM_CRB_MMIO_BASE: u64 = 0x10000210000;
+/// External TPM CRB (swtpm MMIO registers) — matches `tpm_external_crb`
+/// device-region in the SP manifest (`qemu-ec-sp.dts`).
+#[cfg(target_os = "none")]
+const TPM_EXTERNAL_CRB_BASE: u64 = 0x60120000;
 
 #[cfg(target_os = "none")]
 fn main() -> ! {
@@ -38,7 +42,7 @@ fn main() -> ! {
 
     // SAFETY: TPM_CRB_MMIO_BASE is mapped as a device region in the SP manifest (qemu-ec-sp.dts).
     unsafe {
-        tpm.init(TPM_CRB_MMIO_BASE);
+        tpm.init(TPM_CRB_MMIO_BASE, TPM_EXTERNAL_CRB_BASE);
     }
 
     // SAFETY: 0x60030000 is mapped as the `ec_uart` device region in the
