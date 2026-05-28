@@ -64,10 +64,24 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 [[package]]
 name = "bit-register"
 version = "0.1.0"
+source = "git+https://github.com/OpenDevicePartnership/odp-utilities?tag=v0.1.0#583015c08ad9855f310bdb25d5cf9abff77b5e08"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
+name = "bit-register"
+version = "0.1.0"
 source = "git+https://github.com/OpenDevicePartnership/odp-utilities#583015c08ad9855f310bdb25d5cf9abff77b5e08"
 dependencies = [
  "num-traits",
 ]
+
+[[package]]
+name = "bitfield"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f798d2d157e547aa99aab0967df39edd0b70307312b6f8bd2848e6abe40896e0"
 
 [[package]]
 name = "bitflags"
@@ -155,10 +169,9 @@ version = "0.1.0"
 dependencies = [
  "aarch64-cpu",
  "log",
- "mctp-rs",
  "num_enum",
+ "odp-client",
  "odp-ffa",
- "qemu-sp-uart",
  "uuid",
 ]
 
@@ -167,6 +180,25 @@ name = "embedded-crc-macros"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4f1c75747a43b086df1a87fb2a889590bc0725e0abf54bba6d0c4bf7bd9e762c"
+
+[[package]]
+name = "embedded-io"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9eb1aa714776b75c7e67e1da744b81a129b3ff919c8712b5e1b32252c1f07cc7"
+
+[[package]]
+name = "espi-device"
+version = "0.1.0"
+source = "git+https://github.com/OpenDevicePartnership/haf-ec-service#fe63c1fc0bb2463922d956003caf8ac9d6224231"
+dependencies = [
+ "bit-register 0.1.0 (git+https://github.com/OpenDevicePartnership/odp-utilities?tag=v0.1.0)",
+ "bitflags",
+ "num-traits",
+ "num_enum",
+ "static_assertions",
+ "subenum",
+]
 
 [[package]]
 name = "find-msvc-tools"
@@ -193,13 +225,19 @@ dependencies = [
 
 [[package]]
 name = "heapless"
-version = "0.8.0"
+version = "0.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0bfb9eb618601c89945a70e254898da93b13be0388091d42117462b265bb3fad"
+checksum = "25ba4bd83f9415b58b4ed8dc5714c76e626a105be4646c02630ad730ad3b5aa4"
 dependencies = [
  "hash32",
  "stable_deref_trait",
 ]
+
+[[package]]
+name = "heck"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "iana-time-zone"
@@ -250,11 +288,11 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 [[package]]
 name = "mctp-rs"
 version = "0.1.0"
-source = "git+https://github.com/dymk/embedded-services.git?branch=dymk%2Fphase-33-mctp-endpoint#4f9ede3f1d976bb2378f0572bd53447db200851a"
+source = "git+https://github.com/dymk/embedded-services.git?rev=b00c3a7#b00c3a7a3f1710fe725a0bbe29c1b6bb936817f1"
 dependencies = [
- "bit-register",
+ "bit-register 0.1.0 (git+https://github.com/OpenDevicePartnership/odp-utilities)",
  "crc",
- "heapless",
+ "espi-device",
  "num_enum",
  "smbus-pec",
  "thiserror",
@@ -291,6 +329,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "odp-client"
+version = "0.1.0"
+source = "git+https://github.com/dymk/embedded-services.git?rev=b00c3a7#b00c3a7a3f1710fe725a0bbe29c1b6bb936817f1"
+dependencies = [
+ "bitfield",
+ "embedded-io",
+ "heapless",
+ "mctp-rs",
+ "paste",
+]
+
+[[package]]
 name = "odp-ffa"
 version = "0.1.0"
 dependencies = [
@@ -304,6 +354,12 @@ name = "once_cell"
 version = "1.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42f5e15c9953c5e4ccceeb2e7382a716482c34515315f7b03532b8b4e8393d2d"
+
+[[package]]
+name = "paste"
+version = "1.0.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "proc-macro2"
@@ -326,6 +382,8 @@ dependencies = [
  "ec-service-lib",
  "hafnium",
  "log",
+ "mctp-rs",
+ "odp-client",
  "odp-ffa",
  "qemu-sp-uart",
  "uuid",
@@ -334,6 +392,9 @@ dependencies = [
 [[package]]
 name = "qemu-sp-uart"
 version = "0.1.0"
+dependencies = [
+ "embedded-io",
+]
 
 [[package]]
 name = "quote"
@@ -370,6 +431,24 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "static_assertions"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
+
+[[package]]
+name = "subenum"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5eee3fb942ed39f3971438fcc7e05e20717e599e14c5c7cb50edd0df2a44b274"
+dependencies = [
+ "heck",
+ "proc-macro2",
+ "quote",
+ "syn",
+]
 
 [[package]]
 name = "syn"
