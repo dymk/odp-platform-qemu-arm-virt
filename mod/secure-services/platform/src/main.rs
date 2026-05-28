@@ -56,8 +56,13 @@ fn main() -> ! {
     // mutability is sufficient because the SP runtime is single-threaded
     // synchronous; nested `borrow_mut` would only happen on a programming
     // error.
-    let ec_relay = RefCell::new(ec_service_lib::services::EcRelay::new(
-        ec_service_lib::services::MctpSerialTransport::new(ec_uart),
+    //
+    // EIDs: src = SP_EID (0x08), dst = EC_EID (0x0A). The MCTP serial medium
+    // has no addressing of its own (per `odp_client::SerialTransport` docs),
+    // so these are stamped onto outbound frames purely for trace clarity and
+    // are not validated on receive.
+    let ec_relay = RefCell::new(odp_client::OdpClient::new(
+        odp_client::SerialTransport::new(ec_uart, mctp_rs::SP_EID, mctp_rs::EC_EID),
     ));
 
     MessageHandler::new()
