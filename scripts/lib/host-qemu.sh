@@ -125,13 +125,16 @@ run_host_efi_and_parse_results() {
         -no-reboot
     )
 
-    # Two-QEMU path: bridge serial1 of host QEMU to an already-running
-    # EC sidecar via its allocated PTY. -serial stdio remains for serial0
-    # (the UEFI shell / test binary banner + [PASS]/[FAIL] lines).
+    # Two-QEMU path: declare the EC-link chardev now, but defer the
+    # `-serial chardev:ec-link` directive until AFTER the host's main
+    # serial directive is appended below. QEMU binds -serial in
+    # declaration order to serial0, serial1, ...; the host's
+    # banner / [PASS]/[FAIL] / "N passed" lines must land on serial0
+    # (where the UEFI shell and the test EFI write), and the EC link
+    # must be serial1.
     if [ -n "${EC_PTY:-}" ]; then
         QEMU_ARGS+=(
             -chardev "serial,id=ec-link,path=$EC_PTY"
-            -serial "chardev:ec-link"
         )
     fi
 
@@ -148,12 +151,15 @@ run_host_efi_and_parse_results() {
         fi
         tee "$TEST_OUTPUT" < "$SERIAL_FIFO" &
         TEE_PID=$!
+        QEMU_ARGS+=(-serial stdio)
+        [ -n "${EC_PTY:-}" ] && QEMU_ARGS+=(-serial "chardev:ec-link")
         timeout "$HOST_TIMEOUT" qemu-system-aarch64 "${QEMU_ARGS[@]}" \
-            -serial stdio > "$SERIAL_FIFO" 2>&1 &
+            > "$SERIAL_FIFO" 2>&1 &
         QEMU_PID=$!
     else
-        timeout "$HOST_TIMEOUT" qemu-system-aarch64 "${QEMU_ARGS[@]}" \
-            -serial "file:$TEST_OUTPUT" &
+        QEMU_ARGS+=(-serial "file:$TEST_OUTPUT")
+        [ -n "${EC_PTY:-}" ] && QEMU_ARGS+=(-serial "chardev:ec-link")
+        timeout "$HOST_TIMEOUT" qemu-system-aarch64 "${QEMU_ARGS[@]}" &
         QEMU_PID=$!
     fi
 

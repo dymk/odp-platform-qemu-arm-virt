@@ -17,12 +17,11 @@ TPM_EFI := $(TARGET_DIR)/tpm.efi
 # Timeout for QEMU execution (seconds)
 QEMU_TIMEOUT ?= 180
 
-# Bounds on the serial-link test (test-sp-ec-link). EC has done its useful work
-# (boot, announce PTY, exchange a few messages) well within 30s, after which it
-# spins in tight async loops that starve the host of CPU. Killing EC early lets
-# host reach the UEFI shell and self-terminate within HOST_SERIAL_TIMEOUT.
+# Bounds on the two-QEMU thermal e2e (test-sp-ec-link). EC has done its useful
+# work (boot, announce PTY, exchange a few messages) well within 30s, after
+# which it spins in tight async loops that starve the host of CPU. Killing EC
+# early lets host reach the UEFI shell and self-terminate within QEMU_TIMEOUT.
 EC_SERIAL_TIMEOUT  ?= 30
-HOST_SERIAL_TIMEOUT ?= 60
 
 # Virtual drive directories for UEFI Shell to find test EFI binaries.
 # Each test runs in its own vdrive so the UEFI shell startup script can
@@ -107,26 +106,31 @@ endif
 	$(call ENDGROUP)
 
 # ------------------------------------------------------------
-# Serial Communication Test
+# Two-QEMU Thermal E2E Test (test-sp-ec-link)
 # ------------------------------------------------------------
 # Launches EC QEMU with `-serial pty` (QEMU allocates a pseudo-tty
-# and prints its path to stderr), parses the path, then launches
-# host QEMU with a `serial` chardev opening that PTY as serial1.
-# Verifies: PTY announced, EC booted, host started without errors.
+# and prints its path to stderr), parses the path, then delegates
+# host QEMU launch + result parsing to the same runner test-sp-services
+# uses (scripts/lib/host-qemu.sh::run_host_efi_and_parse_results).
+# Asserts the [PASS] line + DeciKelvin range originated from the EC.
 #
 # Caller (top-level Makefile) is responsible for ensuring `ec` and `uefi`
-# are built; this target only runs the serial check.
+# are built; this target only runs the e2e check.
 .PHONY: test-sp-ec-link
-test-sp-ec-link: | builder-image
+test-sp-ec-link: $(VDRIVE_THERMAL_DIR) $(COVERAGE_PLUGIN) | builder-image
 	@mkdir -p Build
-	@echo "=== Running SP+EC link smoke test (EC timeout=$(EC_SERIAL_TIMEOUT)s, host timeout=$(HOST_SERIAL_TIMEOUT)s) ==="
-	$(call GROUP,SP+EC link smoke test)
+	@echo "=== Running two-QEMU Thermal e2e (EC timeout=$(EC_SERIAL_TIMEOUT)s, host timeout=$(QEMU_TIMEOUT)s) ==="
+	$(call GROUP,Two-QEMU Thermal e2e)
 	@$(DC_RUN) -- scripts/test-sp-ec-link.sh \
 		--ec-elf $(EC_BINARY) \
 		--bios-fv-dir $(BIOS_FV_DIR) \
 		--build-dir e2e-tests/Build \
+		--vdrive-dir e2e-tests/$(VDRIVE_THERMAL_DIR) \
+		--coverage-plugin e2e-tests/$(COVERAGE_PLUGIN) \
+		--coverage-log e2e-tests/$(COVERAGE_LOG) \
 		--ec-timeout $(EC_SERIAL_TIMEOUT) \
-		--host-timeout $(HOST_SERIAL_TIMEOUT) \
+		--host-timeout $(QEMU_TIMEOUT) \
+		--serial-tee $(SERIAL_TEE) \
 		-- $(QEMU_COMMON_ARGS)
 	$(call ENDGROUP)
 
