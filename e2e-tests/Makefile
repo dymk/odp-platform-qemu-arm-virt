@@ -24,8 +24,13 @@ QEMU_TIMEOUT ?= 180
 EC_SERIAL_TIMEOUT  ?= 30
 HOST_SERIAL_TIMEOUT ?= 60
 
-# Virtual drive directory for UEFI Shell to find test EFI binaries
-VDRIVE_DIR := Build/vdrive
+# Virtual drive directories for UEFI Shell to find test EFI binaries.
+# Each test runs in its own vdrive so the UEFI shell startup script can
+# unambiguously target one binary (no parameterising the shell). Splitting
+# the vdrive also lets the two-QEMU thermal path and the single-QEMU TPM
+# path stage independent payloads.
+VDRIVE_THERMAL_DIR := Build/vdrive-thermal
+VDRIVE_TPM_DIR     := Build/vdrive-tpm
 
 # Tee QEMU serial output to stdout (auto-enabled in CI). Passed through to
 # scripts/test-sp-services.sh, which owns the actual -serial / tee plumbing.
@@ -56,13 +61,19 @@ build: builder-image
 	$(call ENDGROUP)
 
 # ------------------------------------------------------------
-# Prepare the virtual FAT drive with test binaries + startup.nsh
+# Prepare per-test virtual FAT drives with binaries + startup.nsh
 # ------------------------------------------------------------
-$(VDRIVE_DIR): build $(TEST_EFIS) startup.nsh
-	rm -rf $(VDRIVE_DIR)
-	mkdir -p $(VDRIVE_DIR)
-	cp $(TEST_EFIS) $(VDRIVE_DIR)/
-	cp startup.nsh $(VDRIVE_DIR)/startup.nsh
+$(VDRIVE_THERMAL_DIR): build $(THERMAL_EFI) startup-thermal.nsh
+	rm -rf $(VDRIVE_THERMAL_DIR)
+	mkdir -p $(VDRIVE_THERMAL_DIR)
+	cp $(THERMAL_EFI)      $(VDRIVE_THERMAL_DIR)/
+	cp startup-thermal.nsh $(VDRIVE_THERMAL_DIR)/startup.nsh
+
+$(VDRIVE_TPM_DIR): build $(TPM_EFI) startup-tpm.nsh
+	rm -rf $(VDRIVE_TPM_DIR)
+	mkdir -p $(VDRIVE_TPM_DIR)
+	cp $(TPM_EFI)          $(VDRIVE_TPM_DIR)/
+	cp startup-tpm.nsh     $(VDRIVE_TPM_DIR)/startup.nsh
 
 # ------------------------------------------------------------
 # Run tests with timeout, capture output, report results
@@ -76,7 +87,7 @@ $(COVERAGE_PLUGIN): builder-image
 	$(call ENDGROUP)
 
 .PHONY: test-sp-services
-test-sp-services: $(VDRIVE_DIR) $(COVERAGE_PLUGIN)
+test-sp-services: $(VDRIVE_TPM_DIR) $(COVERAGE_PLUGIN)
 	@mkdir -p Build
 	@echo "=== Running SP services E2E tests (timeout=$(QEMU_TIMEOUT)s) ==="
 ifeq ($(SERIAL_TEE),1)
@@ -87,7 +98,7 @@ endif
 	@$(DC_RUN) -- scripts/test-sp-services.sh \
 		--bios-fv-dir $(BIOS_FV_DIR) \
 		--build-dir e2e-tests/Build \
-		--vdrive-dir e2e-tests/$(VDRIVE_DIR) \
+		--vdrive-dir e2e-tests/$(VDRIVE_TPM_DIR) \
 		--coverage-plugin e2e-tests/$(COVERAGE_PLUGIN) \
 		--coverage-log e2e-tests/$(COVERAGE_LOG) \
 		--host-timeout $(QEMU_TIMEOUT) \
