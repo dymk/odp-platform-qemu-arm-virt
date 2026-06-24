@@ -6,4 +6,4 @@
 	url = https://github.com/dymk/odp-secure-services.git
 [submodule "odp-embedded-controller"]
 	path = mod/ec
-	url = https://github.com/OpenDevicePartnership/odp-embedded-controller.git
+	url = https://github.com/dymk/odp-embedded-controller.git
