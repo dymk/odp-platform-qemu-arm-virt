@@ -57,15 +57,20 @@ COVERAGE_LOG=""
 HOST_TIMEOUT=180
 SERIAL_TEE=0
 
+require_arg() {
+    # require_arg <flag-name> <value-or-empty>
+    [ -n "$2" ] || { echo "ERROR: $1 requires a value" >&2; exit 1; }
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --bios-fv-dir)     BIOS_FV_DIR="$2";     shift 2 ;;
-        --build-dir)       BUILD_DIR="$2";       shift 2 ;;
-        --vdrive-dir)      VDRIVE_DIR="$2";      shift 2 ;;
-        --coverage-plugin) COVERAGE_PLUGIN="$2"; shift 2 ;;
-        --coverage-log)    COVERAGE_LOG="$2";    shift 2 ;;
-        --host-timeout)    HOST_TIMEOUT="$2";    shift 2 ;;
-        --serial-tee)      SERIAL_TEE="$2";      shift 2 ;;
+        --bios-fv-dir)     require_arg "$1" "${2-}"; BIOS_FV_DIR="$2";     shift 2 ;;
+        --build-dir)       require_arg "$1" "${2-}"; BUILD_DIR="$2";       shift 2 ;;
+        --vdrive-dir)      require_arg "$1" "${2-}"; VDRIVE_DIR="$2";      shift 2 ;;
+        --coverage-plugin) require_arg "$1" "${2-}"; COVERAGE_PLUGIN="$2"; shift 2 ;;
+        --coverage-log)    require_arg "$1" "${2-}"; COVERAGE_LOG="$2";    shift 2 ;;
+        --host-timeout)    require_arg "$1" "${2-}"; HOST_TIMEOUT="$2";    shift 2 ;;
+        --serial-tee)      require_arg "$1" "${2-}"; SERIAL_TEE="$2";      shift 2 ;;
         --help|-h)         usage; exit 0 ;;
         --)                shift; break ;;
         *) echo "ERROR: unknown arg: $1" >&2; usage >&2; exit 2 ;;
