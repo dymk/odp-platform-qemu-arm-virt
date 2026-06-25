@@ -52,3 +52,148 @@ set_host_pflash_tpm_args() {
         -device "tpm-tis-device,tpmdev=tpm0"
     )
 }
+
+# run_host_efi_and_parse_results
+#   Canonical EFI runner shared by the single-QEMU TPM path
+#   (test-sp-services.sh) and the two-QEMU thermal path
+#   (test-sp-ec-link.sh). Owns swtpm lifecycle, host QEMU launch
+#   (with optional EC-sidecar PTY chardev), serial capture, and the
+#   grep-based result classification.
+#
+#   Required env vars (set by the caller before invocation):
+#     BIOS_FV_DIR      Path to SECURE_FLASH0.fd / QEMU_EFI.fd
+#     BUILD_DIR        Build/ root for logs, swtpm state, exit-code file
+#     VDRIVE_DIR       FAT drive directory exposed to the UEFI shell
+#     COVERAGE_PLUGIN  Path to QEMU TCG coverage plugin (.so)
+#     COVERAGE_LOG     Output path for PC trace
+#     HOST_TIMEOUT     Seconds for the host QEMU run (integer)
+#     SERIAL_TEE       1 = stream serial to BOTH stdout and TEST_OUTPUT
+#                      0 = file only
+#     QEMU_COMMON_ARGS Bash array of common args (machine/cpu/mem/...)
+#
+#   Optional env var:
+#     EC_PTY           If non-empty, the helper appends
+#                      `-chardev serial,id=ec-link,path=$EC_PTY`
+#                      `-serial chardev:ec-link` to host QEMU's args so
+#                      the host can talk to a pre-launched EC sidecar.
+#
+#   Caller responsibilities (NOT done here):
+#     - require_swtpm_tools / require_host_qemu_tools /
+#       (if SERIAL_TEE=1) require_host_serial_tee_tools
+#     - mkdir -p "$BUILD_DIR"
+#     - any pre-cleanup of caller-owned files
+#
+#   Exit-code propagation (helper returns; caller propagates):
+#     0  banner present, "N passed, 0 failed", QEMU exit 0
+#     1  banner missing, [FAIL] present, timed out, other failure
+run_host_efi_and_parse_results() {
+    local SWTPM_DIR="$BUILD_DIR/tpm"
+    local SWTPM_SOCK="$SWTPM_DIR/swtpm-sock"
+    local SWTPM_LOG="$BUILD_DIR/swtpm.log"
+    local TEST_OUTPUT="$BUILD_DIR/test-output.log"
+    local QEMU_EXIT_FILE="$BUILD_DIR/qemu-exit-code"
+    local SERIAL_FIFO="$BUILD_DIR/serial.fifo"
+
+    rm -f "$SWTPM_SOCK"
+
+    # swtpm — start fresh under the caller's cleanup trap. SWTPM_PID is
+    # set in the caller's scope by start_swtpm (no `local` in
+    # lib/swtpm.sh), so the caller's existing EXIT trap can tear it
+    # down on signal interruption mid-`wait`.
+    start_swtpm "$SWTPM_DIR" "$SWTPM_SOCK" "$SWTPM_LOG"
+    if ! wait_for_swtpm_socket "$SWTPM_SOCK"; then
+        dump_swtpm_log_on_failure "$SWTPM_LOG" 2>/dev/null || true
+        kill_swtpm
+        return 1
+    fi
+
+    # QEMU_PID / TEE_PID intentionally NOT local — the caller's EXIT
+    # trap reaches them on signal interruption (same pattern as
+    # SWTPM_PID). Cleared at end of normal-path so a follow-up call
+    # doesn't double-kill.
+    QEMU_PID=""
+    TEE_PID=""
+
+    set_host_pflash_tpm_args "$BIOS_FV_DIR" "$SWTPM_SOCK"
+
+    local QEMU_ARGS=(
+        "${QEMU_COMMON_ARGS[@]}"
+        -plugin "file=$COVERAGE_PLUGIN,outfile=$COVERAGE_LOG"
+        "${HOST_PFLASH_TPM_ARGS[@]}"
+        -drive "file=fat:rw:$VDRIVE_DIR,format=raw,media=disk"
+        -display none
+        -no-reboot
+    )
+
+    # Two-QEMU path: declare the EC-link chardev now, but defer the
+    # `-serial chardev:ec-link` directive until AFTER the host's main
+    # serial directive is appended below. QEMU binds -serial in
+    # declaration order to serial0, serial1, ...; the host's
+    # banner / [PASS]/[FAIL] / "N passed" lines must land on serial0
+    # (where the UEFI shell and the test EFI write), and the EC link
+    # must be serial1.
+    if [ -n "${EC_PTY:-}" ]; then
+        QEMU_ARGS+=(
+            -chardev "serial,id=ec-link,path=$EC_PTY"
+        )
+    fi
+
+    if [ "$SERIAL_TEE" = "1" ]; then
+        # See test-sp-services.sh history for the FIFO+tee rationale:
+        # we need $! to point at QEMU (not tee) so the caller's cleanup
+        # trap tears down QEMU and `wait $QEMU_PID` surfaces QEMU's
+        # exit code (e.g. timeout's 124).
+        rm -f "$SERIAL_FIFO"
+        if ! mkfifo "$SERIAL_FIFO"; then
+            echo "ERROR: failed to create serial FIFO at $SERIAL_FIFO" >&2
+            kill_swtpm
+            return 1
+        fi
+        tee "$TEST_OUTPUT" < "$SERIAL_FIFO" &
+        TEE_PID=$!
+        QEMU_ARGS+=(-serial stdio)
+        [ -n "${EC_PTY:-}" ] && QEMU_ARGS+=(-serial "chardev:ec-link")
+        timeout "$HOST_TIMEOUT" qemu-system-aarch64 "${QEMU_ARGS[@]}" \
+            > "$SERIAL_FIFO" 2>&1 &
+        QEMU_PID=$!
+    else
+        QEMU_ARGS+=(-serial "file:$TEST_OUTPUT")
+        [ -n "${EC_PTY:-}" ] && QEMU_ARGS+=(-serial "chardev:ec-link")
+        timeout "$HOST_TIMEOUT" qemu-system-aarch64 "${QEMU_ARGS[@]}" &
+        QEMU_PID=$!
+    fi
+
+    wait "$QEMU_PID"
+    local QEMU_EXIT=$?
+    QEMU_PID=""
+    if [ -n "${TEE_PID:-}" ]; then
+        wait "$TEE_PID" 2>/dev/null
+        TEE_PID=""
+        rm -f "$SERIAL_FIFO"
+    fi
+    echo "$QEMU_EXIT" > "$QEMU_EXIT_FILE"
+
+    # Stop swtpm before result analysis (frees the socket).
+    kill_swtpm
+
+    echo "=== Test output summary ==="
+    grep -E "\[(PASS|FAIL)\]" "$TEST_OUTPUT" || true
+    echo ""
+
+    if ! grep -q "EC Secure Partition E2E Tests" "$TEST_OUTPUT"; then
+        echo "RESULT: TESTS NEVER RAN (banner not found in output)"
+        return 1
+    elif grep -q "\[FAIL\]" "$TEST_OUTPUT"; then
+        echo "RESULT: SOME TESTS FAILED"
+        return 1
+    elif [ "$QEMU_EXIT" = "0" ] && grep -qE '^--- Results: [0-9]+ passed, 0 failed ---$' "$TEST_OUTPUT"; then
+        echo "RESULT: ALL TESTS PASSED"
+        return 0
+    elif [ "$QEMU_EXIT" = "124" ]; then
+        echo "RESULT: TIMED OUT (no test output seen)"
+        return 1
+    else
+        echo "RESULT: NO TEST OUTPUT FOUND (exit code $QEMU_EXIT)"
+        return 1
+    fi
+}
