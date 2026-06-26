@@ -61,7 +61,7 @@ $(EC_SUBMODULE_MANIFEST):
 # parse time) still invalidates the binary.
 $(EC_BINARY_LOCAL): $(EC_SUBMODULE_MANIFEST) $(EC_SOURCES) ../.git/modules/odp-embedded-controller/HEAD | builder-image
 	$(call GROUP,Build EC firmware)
-	@$(DC_RUN) -w mod/$(EC_BUILD_DIR) -- cargo build --release --locked
+	@$(DC_RUN) -w mod/$(EC_BUILD_DIR) -- cargo build --release --locked --features sp-serial
 	$(call ENDGROUP)
 	@touch $@
 
