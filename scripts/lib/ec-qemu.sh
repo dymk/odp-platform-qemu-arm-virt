@@ -34,12 +34,27 @@ require_ec_qemu_tools() {
 #   PID. The pipeline routes:
 #     qemu stderr -> <stderr-log>
 #     qemu stdout | stdbuf tee <stdout-log> | defmt-print -> <serial-log>
+#
+#   The EC `dev-qemu` platform runs on the custom `ec` machine (RISC-V
+#   Embedded Controller), which exposes the I2C-target and GPIO lines as
+#   UNIX-domain sockets plus a PTY for UART0 — mirroring the EC's own
+#   launcher `mod/ec/platform/dev-qemu/qemu-ec.sh` (the single source of
+#   truth for how dev-qemu is run). `qemu-system-riscv32` must therefore
+#   be the `ec`-capable build from `odp-qemu-builder` (the devcontainer
+#   provides it); the stock upstream binary only has the `virt` machine.
+#   The I2C/GPIO sockets are non-blocking servers (wait=off) — the
+#   MCTP-over-serial relay the e2e exercises rides UART0 (the PTY), so
+#   nothing needs to connect to them for the thermal round-trip.
 start_ec_qemu() {
     local elf="$1" out_log="$2" err_log="$3" serial_log="$4" timeout_s="$5"
+    local i2c_sock="${EC_I2C_SOCK:-/tmp/qemu-ec-i2c.sock}"
+    local gpio_sock="${EC_GPIO_SOCK:-/tmp/qemu-ec-gpio.sock}"
+    # Stale sockets from a previous run would make `server=on` fail to bind.
+    rm -f "$i2c_sock" "$gpio_sock"
     # Log files are pre-cleared by the orchestrator (`rm -f`); shell redirection
     # below creates them fresh. No truncation needed here.
     setsid bash -c "timeout $timeout_s qemu-system-riscv32 \
-        -machine virt \
+        -machine ec \
         -bios none \
         -kernel \"$elf\" \
         -semihosting \
@@ -47,6 +62,8 @@ start_ec_qemu() {
         -serial pty \
         -monitor none \
         -no-reboot \
+        -chardev socket,id=ec-i2c-target,path=\"$i2c_sock\",server=on,wait=off \
+        -chardev socket,id=ec-gpio0,path=\"$gpio_sock\",server=on,wait=off \
         2> \"$err_log\" \
         | stdbuf -oL tee \"$out_log\" \
         | stdbuf -oL defmt-print -e \"$elf\"" \

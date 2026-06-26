@@ -144,8 +144,13 @@ COPY mod/uefi/patina-qemu/pip-requirements.txt /tmp/pip-requirements.txt
 RUN pip install --upgrade -r /tmp/pip-requirements.txt pip lcov_cobertura
 USER root
 
-COPY --from=ghcr.io/opendevicepartnership/odp-qemu-builder/qemu@sha256:94b4d88aea7fadc7788dfe7fd470168a36ad5b1e0a5e5763ef190557d33f367a /usr/local/bin/qemu-system-aarch64 /usr/local/bin/qemu-system-aarch64
-COPY --from=ghcr.io/opendevicepartnership/odp-qemu-builder/qemu@sha256:94b4d88aea7fadc7788dfe7fd470168a36ad5b1e0a5e5763ef190557d33f367a /usr/local/bin/qemu-system-riscv32 /usr/local/bin/qemu-system-riscv32
-COPY --from=ghcr.io/opendevicepartnership/odp-qemu-builder/qemu@sha256:94b4d88aea7fadc7788dfe7fd470168a36ad5b1e0a5e5763ef190557d33f367a /usr/local/share/qemu/ /usr/local/share/qemu/
+# odp-qemu-builder QEMU build (tag sha-7e461b3). This digest is the
+# first to ship the riscv32 `ec` machine (RISC-V Embedded Controller)
+# that EC dev-qemu targets since odp-embedded-controller #28; the
+# two-QEMU EC sidecar (scripts/lib/ec-qemu.sh) launches `-machine ec`.
+# aarch64 (sbsa-ref host) + the shared firmware come from the same build.
+COPY --from=ghcr.io/opendevicepartnership/odp-qemu-builder/qemu@sha256:6837745ad1ac7963701be1d4aff4b26c9f2f00f18516bce45134fc354d7d3976 /usr/local/bin/qemu-system-aarch64 /usr/local/bin/qemu-system-aarch64
+COPY --from=ghcr.io/opendevicepartnership/odp-qemu-builder/qemu@sha256:6837745ad1ac7963701be1d4aff4b26c9f2f00f18516bce45134fc354d7d3976 /usr/local/bin/qemu-system-riscv32 /usr/local/bin/qemu-system-riscv32
+COPY --from=ghcr.io/opendevicepartnership/odp-qemu-builder/qemu@sha256:6837745ad1ac7963701be1d4aff4b26c9f2f00f18516bce45134fc354d7d3976 /usr/local/share/qemu/ /usr/local/share/qemu/
 
 USER vscode
