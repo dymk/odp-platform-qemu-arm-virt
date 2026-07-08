@@ -17,7 +17,7 @@ exercise the EC Secure Partition services via FF-A Direct Request messages.
 | `tests/tpm/` | TPM service E2E test application |
 | `coverage-plugin/` | QEMU TCG plugin for code coverage collection |
 | `scripts/` | Post-processing scripts (e.g., PC trace to lcov conversion) |
-| `startup.nsh` | UEFI shell startup script that launches the test binaries |
+| `startup.nsh` | Generic UEFI shell startup script (runs the single `.efi` staged on each per-test vdrive) |
 | `Makefile` | Build and execution targets for the E2E test suite |
 
 ## Build

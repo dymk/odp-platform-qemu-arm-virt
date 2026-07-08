@@ -57,12 +57,14 @@ run_ec:
 # Run E2E tests against the secure partition
 # ------------------------------------------------------------
 # Two phases:
-#   1. Serial-link smoke test (EC<->host via PTY) using the default
-#      secure-services build.
-#   2. Full e2e suite — rebuild secure-services with test-bypass
-#      features, rebuild uefi with the test SP embedded, run tests.
+#   1. Two-QEMU Thermal e2e (test-sp-ec-link): EC sidecar + host SP
+#      relaying Thermal.GetTmp through MCTP. Uses the default
+#      secure-services build (no test-bypass) so the relay code path
+#      under test matches what ships.
+#   2. Single-QEMU TPM suite — rebuild secure-services with test-bypass
+#      features, rebuild uefi with the test SP embedded, run TPM tests.
 # Order matters: phase 2 clobbers the default secure-services binary,
-# so the serial-link test must run first.
+# so the thermal e2e (which needs the non-test-bypass relay) must run first.
 e2e-test: ec uefi
 	$(MAKE) -C e2e-tests test-sp-ec-link
 	$(MAKE) -C mod secure-services-test

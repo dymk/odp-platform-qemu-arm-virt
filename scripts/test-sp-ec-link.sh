@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# Orchestrate the EC ↔ host serial-link test
+# Orchestrate the two-QEMU thermal E2E test (host SP ↔ EC over MCTP/PL011).
 #
 # SPDX-License-Identifier: MIT
 #
-# Owns the long-lived child processes (swtpm + EC QEMU + host QEMU),
-# sets up the cleanup trap, and performs post-run verification.
+# Owns the EC sidecar lifecycle (RISC-V QEMU + PTY discovery) and
+# delegates host QEMU launch + result classification to
+# scripts/lib/host-qemu.sh::run_host_efi_and_parse_results. The
+# previous incarnation was a serial-link smoke test; this rewrite
+# asserts that the EC actually originated the response (DeciKelvin
+# range, [PASS] line) via the unified runner.
 #
 # Run `test-sp-ec-link.sh --help` for usage. Must be executed inside the
 # odp-platform-qemu-arm-virt devcontainer (requires swtpm, qemu-system-riscv32,
@@ -25,23 +29,30 @@ source "$SCRIPT_DIR/lib/host-qemu.sh"
 usage() {
     cat <<'EOF'
 Usage: test-sp-ec-link.sh --ec-elf PATH --bios-fv-dir DIR --build-dir DIR \
-                      [--ec-timeout N] [--host-timeout N] -- <qemu-common-args...>
+                          --vdrive-dir DIR --coverage-plugin PATH --coverage-log PATH \
+                          [--ec-timeout N] [--host-timeout N] [--serial-tee 0|1] \
+                          -- <qemu-common-args...>
 
-  --ec-elf        EC firmware ELF (riscv32)
-  --bios-fv-dir   Directory containing SECURE_FLASH0.fd and QEMU_EFI.fd
-  --build-dir     Build/ directory (logs and swtpm-state live here)
-  --ec-timeout    Seconds for EC QEMU run (default: 30)
-  --host-timeout  Seconds for host QEMU run (default: 60)
-  --              Everything after this is forwarded verbatim to
-                  qemu-system-aarch64 as the host common args (machine,
-                  cpu, mem, smbios, etc.)
+  --ec-elf           EC firmware ELF (riscv32)
+  --bios-fv-dir      Directory containing SECURE_FLASH0.fd and QEMU_EFI.fd
+  --build-dir        Build/ directory (logs and swtpm-state live here)
+  --vdrive-dir       FAT drive directory exposed to UEFI shell
+                     (typically e2e-tests/Build/vdrive-thermal)
+  --coverage-plugin  Path to TCG coverage plugin (.so)
+  --coverage-log     Path to write QEMU coverage PC trace
+  --ec-timeout       Seconds for EC QEMU run (default: 30)
+  --host-timeout     Seconds for host QEMU run (default: 180)
+  --serial-tee       1 = tee QEMU serial to stdout AND file; 0 = file only (default: 0)
+  --                 Everything after this is forwarded verbatim to
+                     qemu-system-aarch64 as the host common args (machine,
+                     cpu, mem, smbios, etc.)
 
 Must run inside the odp-platform-qemu-arm-virt devcontainer.
 
 Exits 0 on PASS, non-zero on FAILURE. The first failure mode wins:
   - Setup error (swtpm socket / EC PTY discovery) -> exits 1
-  - host QEMU non-zero exit -> exits with that code (verification skipped)
-  - EC boot string missing  -> exits 1 (after host succeeded)
+  - host QEMU classification (test FAIL / timeout / banner missing) -> exits 1
+  - EC boot string missing (verified AFTER helper returns) -> exits 1
 EOF
     exit "${1:-0}"
 }
@@ -49,32 +60,47 @@ EOF
 EC_ELF=""
 BIOS_FV_DIR=""
 BUILD_DIR=""
+VDRIVE_DIR=""
+COVERAGE_PLUGIN=""
+COVERAGE_LOG=""
 EC_TIMEOUT=30
-HOST_TIMEOUT=60
+HOST_TIMEOUT=180
+SERIAL_TEE=0
 
 require_arg() {
     # require_arg <flag-name> <value-or-empty>
-    [ -n "$2" ] || { echo "ERROR: $1 requires a value" >&2; exit 1; }
+    # Reject a missing value, or one that looks like the next flag — a
+    # forgotten value would otherwise silently consume the following option.
+    case "${2-}" in
+        ''|-*) echo "ERROR: $1 requires a value" >&2; exit 1 ;;
+    esac
 }
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --ec-elf)       require_arg "$1" "${2-}"; EC_ELF="$2"; shift 2 ;;
-        --bios-fv-dir)  require_arg "$1" "${2-}"; BIOS_FV_DIR="$2"; shift 2 ;;
-        --build-dir)    require_arg "$1" "${2-}"; BUILD_DIR="$2"; shift 2 ;;
-        --ec-timeout)   require_arg "$1" "${2-}"; EC_TIMEOUT="$2"; shift 2 ;;
-        --host-timeout) require_arg "$1" "${2-}"; HOST_TIMEOUT="$2"; shift 2 ;;
-        -h|--help)      usage 0 ;;
-        --)             shift; break ;;
-        *)              echo "Unknown arg: $1" >&2; usage 1 ;;
+        --ec-elf)          require_arg "$1" "${2-}"; EC_ELF="$2";          shift 2 ;;
+        --bios-fv-dir)     require_arg "$1" "${2-}"; BIOS_FV_DIR="$2";     shift 2 ;;
+        --build-dir)       require_arg "$1" "${2-}"; BUILD_DIR="$2";       shift 2 ;;
+        --vdrive-dir)      require_arg "$1" "${2-}"; VDRIVE_DIR="$2";      shift 2 ;;
+        --coverage-plugin) require_arg "$1" "${2-}"; COVERAGE_PLUGIN="$2"; shift 2 ;;
+        --coverage-log)    require_arg "$1" "${2-}"; COVERAGE_LOG="$2";    shift 2 ;;
+        --ec-timeout)      require_arg "$1" "${2-}"; EC_TIMEOUT="$2";      shift 2 ;;
+        --host-timeout)    require_arg "$1" "${2-}"; HOST_TIMEOUT="$2";    shift 2 ;;
+        --serial-tee)      require_arg "$1" "${2-}"; SERIAL_TEE="$2";      shift 2 ;;
+        -h|--help)         usage 0 ;;
+        --)                shift; break ;;
+        *)                 echo "Unknown arg: $1" >&2; usage 1 ;;
     esac
 done
 # Remaining "$@" is the host QEMU common args (smbios, machine, cpu, etc.)
 
-if [ -z "$EC_ELF" ] || [ -z "$BIOS_FV_DIR" ] || [ -z "$BUILD_DIR" ]; then
-    echo "ERROR: --ec-elf, --bios-fv-dir, and --build-dir are required" >&2
-    usage 1
-fi
+for var in EC_ELF BIOS_FV_DIR BUILD_DIR VDRIVE_DIR COVERAGE_PLUGIN COVERAGE_LOG; do
+    if [ -z "${!var}" ]; then
+        flag="${var,,}"; flag="${flag//_/-}"
+        echo "ERROR: --${flag} (\$$var) is required" >&2
+        usage 1
+    fi
+done
 
 # Validate timeouts at parse time. start_ec_qemu interpolates $timeout_s into
 # an inner `bash -c` string (via setsid), so non-numeric input would risk
@@ -95,79 +121,81 @@ esac
 require_swtpm_tools || exit 1
 require_ec_qemu_tools || exit 1
 require_host_qemu_tools || exit 1
+[ "$SERIAL_TEE" = "1" ] && { require_host_serial_tee_tools || exit 1; }
 
-SWTPM_STATE="$BUILD_DIR/swtpm-state"
-SWTPM_SOCK="$SWTPM_STATE/swtpm-sock"
-SWTPM_LOG="$BUILD_DIR/swtpm.log"
 EC_OUT_LOG="$BUILD_DIR/ec-qemu-stdout.log"
 EC_ERR_LOG="$BUILD_DIR/ec-qemu-stderr.log"
 EC_SERIAL_LOG="$BUILD_DIR/ec-serial-output.log"
-HOST_SERIAL_LOG="$BUILD_DIR/host-serial-output.log"
+SERIAL_FIFO="$BUILD_DIR/serial.fifo"
 
+# Caller-scope vars touched by the helper / EC library — listed here so the
+# cleanup trap reaches them on signal interruption.
 EC_PID=""
 SWTPM_PID=""
+QEMU_PID=""
+TEE_PID=""
 
 # shellcheck disable=SC2329  # invoked via `trap ... EXIT` below
 cleanup() {
-    # SC2317: invoked via `trap ... EXIT`, not statically reachable.
+    # shellcheck disable=SC2317
+    [ -n "${QEMU_PID:-}" ] && kill "$QEMU_PID" 2>/dev/null
+    # shellcheck disable=SC2317
+    [ -n "${TEE_PID:-}" ] && kill "$TEE_PID" 2>/dev/null
     # shellcheck disable=SC2317
     kill_ec_session
     # shellcheck disable=SC2317
     kill_swtpm
     # shellcheck disable=SC2317
+    wait 2>/dev/null
+    # shellcheck disable=SC2317
+    [ -n "${SERIAL_FIFO:-}" ] && rm -f "$SERIAL_FIFO"
+    # shellcheck disable=SC2317
     true
 }
 trap cleanup EXIT
 
-mkdir -p "$BUILD_DIR" "$SWTPM_STATE"
-rm -f "$EC_OUT_LOG" "$EC_ERR_LOG" "$EC_SERIAL_LOG" "$HOST_SERIAL_LOG" "$SWTPM_SOCK"
+mkdir -p "$BUILD_DIR"
+rm -f "$EC_OUT_LOG" "$EC_ERR_LOG" "$EC_SERIAL_LOG"
 
-# 1. swtpm
-start_swtpm "$SWTPM_STATE" "$SWTPM_SOCK" "$SWTPM_LOG"
-wait_for_swtpm_socket "$SWTPM_SOCK" || {
-    dump_swtpm_log_on_failure "$SWTPM_LOG"
-    exit 1
-}
-
-# 2. EC QEMU + PTY discovery
+# 1. EC QEMU sidecar + PTY discovery (swtpm is owned by the helper now).
 start_ec_qemu "$EC_ELF" "$EC_OUT_LOG" "$EC_ERR_LOG" "$EC_SERIAL_LOG" "$EC_TIMEOUT"
 PTY=$(discover_ec_pty "$EC_OUT_LOG" "$EC_ERR_LOG") || exit 1
-echo "EC PTY: $PTY — launching host QEMU"
+echo "EC PTY: $PTY — launching host QEMU via run_host_efi_and_parse_results"
 
-# 3. host QEMU
-set_host_pflash_tpm_args "$BIOS_FV_DIR" "$SWTPM_SOCK"
+# 2. Hand off to the canonical EFI runner. It owns swtpm + host QEMU +
+#    serial capture + the [PASS]/[FAIL] + "N passed, 0 failed" parse.
+#    Pass the EC sidecar PTY so the helper bridges host's serial1.
+QEMU_COMMON_ARGS=("$@")
+EC_PTY="$PTY"
+HELPER_EXIT=0
+run_host_efi_and_parse_results || HELPER_EXIT=$?
 
-QEMU_ARGS=(
-    "$@"
-    "${HOST_PFLASH_TPM_ARGS[@]}"
-    -chardev "serial,id=ec-link,path=$PTY"
-    -serial "file:$HOST_SERIAL_LOG"
-    -serial "chardev:ec-link"
-    -drive "file=fat:rw:test-serial-vdrive,format=raw,media=disk"
-    -display none
-    -no-reboot
-)
-
-HOST_EXIT=0
-timeout "$HOST_TIMEOUT" qemu-system-aarch64 "${QEMU_ARGS[@]}" || HOST_EXIT=$?
-
-# 4. host failure short-circuits before verification (matches original recipe).
-if [ "$HOST_EXIT" -ne 0 ]; then
-    echo "host QEMU exited with code $HOST_EXIT" >&2
-    exit "$HOST_EXIT"
-fi
-
-# 5. Tear down the EC pipeline BEFORE verification so that defmt-print's
-# block-buffered stdout (redirected to a regular file) is fully flushed to
-# $EC_SERIAL_LOG before we grep it. The original Makefile recipe got this
-# for free: verification ran in a separate shell after the bash -lc subshell's
-# EXIT trap had already reaped EC. Clear EC_PID so the EXIT trap below
-# doesn't try to tear it down a second time.
+# 3. Tear down the EC pipeline BEFORE verification so that defmt-print's
+#    block-buffered stdout (redirected to a regular file) is fully flushed
+#    to $EC_SERIAL_LOG before we grep it. The original Makefile recipe
+#    got this for free: verification ran in a separate shell after the
+#    bash -lc subshell's EXIT trap had already reaped EC. Clear EC_PID so
+#    the EXIT trap below doesn't try to tear it down a second time.
 kill_ec_session
 EC_PID=""
 
-# 6. Verification (only on host success).
-PASS=true
+# 4. Layer the EC-boot grep on top of the helper's classification.
+#    First failure mode wins: if the helper said FAIL, we propagate that;
+#    EC-boot is a secondary gate that catches "EC silently died but
+#    fixture happened to time out cleanly".
+if [ "$HELPER_EXIT" -ne 0 ]; then
+    echo "host runner reported failure (exit $HELPER_EXIT)" >&2
+    # Surface the EC sidecar's state so a relay failure (e.g. thermal
+    # status=-1 from the SP) can be attributed to the EC vs the host SP.
+    # kill_ec_session above flushed defmt-print into $EC_SERIAL_LOG.
+    echo "=== EC serial output (decoded) ===" >&2
+    cat "$EC_SERIAL_LOG" 2>/dev/null || echo "(empty)" >&2
+    echo "=== EC QEMU stderr ===" >&2
+    cat "$EC_ERR_LOG" 2>/dev/null || echo "(empty)" >&2
+    echo "=== End EC diagnostics ===" >&2
+    exit "$HELPER_EXIT"
+fi
+
 if grep -q "Starting uart service" "$EC_SERIAL_LOG" 2>/dev/null; then
     echo "EC: boot successful (PTY serial backend)"
 else
@@ -175,19 +203,8 @@ else
     cat "$EC_SERIAL_LOG" 2>/dev/null || echo "(empty)"
     echo "=== End EC serial output ==="
     echo "EC: boot FAILED — 'Starting uart service' not found"
-    PASS=false
-fi
-
-if [ -s "$HOST_SERIAL_LOG" ]; then
-    echo "host: produced serial output (PTY connected)"
-else
-    echo "host: WARNING — no serial output captured (may be OK if boot is slow)"
-fi
-
-if "$PASS"; then
-    echo "RESULT: SERIAL LINK TEST PASSED"
-    exit 0
-else
-    echo "RESULT: SERIAL LINK TEST FAILED"
     exit 1
 fi
+
+echo "RESULT: ALL TESTS PASSED"
+exit 0

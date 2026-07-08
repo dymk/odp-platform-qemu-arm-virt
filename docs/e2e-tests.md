@@ -189,9 +189,11 @@ Add a new `fn test_*()` function in the relevant test binary (e.g.,
    members = ["ffa", "uart-logger", "test-support", "tests/thermal", "tests/<service>"]
    ```
 3. Update `e2e-tests/Makefile`:
-   - Add the new `.efi` path to `TEST_EFIS`.
-   - Copy it into `$(VDRIVE_DIR)` in the vdrive target.
-   - Add it to `startup.nsh` (or have the previous binary chain-load it).
+   - Add the new `.efi` path (e.g. `<SERVICE>_EFI := $(TARGET_DIR)/<service>.efi`).
+   - Add a per-test vdrive dir (e.g. `VDRIVE_<SERVICE>_DIR := Build/vdrive-<service>`)
+     and a target that stages it: `$(call make-vdrive,$(VDRIVE_<SERVICE>_DIR),$(<SERVICE>_EFI))`.
+   - No startup script needed — the shared generic `startup.nsh` runs whichever
+     single `.efi` is on the vdrive.
 
 ### Service UUIDs
 
