@@ -67,6 +67,7 @@ run_ec:
 # so the thermal e2e (which needs the non-test-bypass relay) must run first.
 e2e-test: ec uefi
 	$(MAKE) -C e2e-tests test-sp-ec-link
+	$(MAKE) -C e2e-tests test-sp-ec-link-battery
 	$(MAKE) -C mod secure-services-test
 	$(MAKE) -C mod uefi-only
 	$(MAKE) -C e2e-tests test-sp-services

@@ -15,6 +15,9 @@ use uuid::Uuid;
 /// also claims the TPM UUID. Both services run in the same EC SP.
 pub const THERMAL_UUID: Uuid = uuid::uuid!("31f56da7-593c-4d72-a4b3-8fc7171ac073");
 
+/// EC Battery service UUID: 25cb5207-ac36-427d-aaef-3aa78877d27e
+pub const BATTERY_UUID: Uuid = uuid::uuid!("25cb5207-ac36-427d-aaef-3aa78877d27e");
+
 pub const FFA_MSG_SEND_DIRECT_REQ2: u64 = 0xC400008D;
 pub const FFA_MSG_SEND_DIRECT_RESP2: u64 = 0xC400008E;
 const FFA_INTERRUPT: u64 = 0x84000062;
@@ -198,6 +201,40 @@ pub fn send_direct_req2(
 /// Extract the response payload (x4..x17) from raw SMC result registers.
 pub fn response_payload(resp: &[u64; 18]) -> DirectMessagePayload {
     DirectMessagePayload::from_iter(resp[4..18].iter().flat_map(|r| r.to_le_bytes()))
+}
+
+/// Build a `[command, args…]` FF-A Direct-Request payload, zero-padded to the
+/// full 14-register (112-byte) message payload the SP services parse.
+pub fn build_request(command: u8, args: &[u8]) -> DirectMessagePayload {
+    DirectMessagePayload::from_iter(
+        core::iter::once(command)
+            .chain(args.iter().copied())
+            .chain(core::iter::repeat(0u8))
+            .take(14 * 8),
+    )
+}
+
+/// Send `command`+`args` to `uuid` on the EC partition `ec_id`, retrying
+/// YIELD/INTERRUPT, and return the response body payload. On no DIRECT_RESP2
+/// (e.g. the SP relay failed and sent no response), fail `test_name` and
+/// return `None`.
+pub fn send_service_command(
+    results: &mut TestResults,
+    test_name: &str,
+    our_id: u16,
+    ec_id: u16,
+    uuid: &Uuid,
+    command: u8,
+    args: &[u8],
+) -> Option<DirectMessagePayload> {
+    let payload = build_request(command, args);
+    match send_direct_req2(our_id, ec_id, uuid, &payload) {
+        Some(resp) => Some(response_payload(&resp)),
+        None => {
+            results.fail(test_name, "no DIRECT_RESP2 from SP");
+            None
+        }
+    }
 }
 
 /// Common test harness: initialises UEFI + UART logging, runs the standard
