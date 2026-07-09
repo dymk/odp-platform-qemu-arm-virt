@@ -13,6 +13,7 @@ include ../Common.mk
 TARGET_DIR := target/aarch64-unknown-uefi/release
 THERMAL_EFI := $(TARGET_DIR)/thermal.efi
 TPM_EFI := $(TARGET_DIR)/tpm.efi
+BATTERY_EFI := $(TARGET_DIR)/battery.efi
 
 # Timeout for QEMU execution (seconds)
 QEMU_TIMEOUT ?= 180
@@ -35,6 +36,7 @@ EC_SERIAL_TIMEOUT  ?= $(QEMU_TIMEOUT)
 # payloads.
 VDRIVE_THERMAL_DIR := Build/vdrive-thermal
 VDRIVE_TPM_DIR     := Build/vdrive-tpm
+VDRIVE_BATTERY_DIR := Build/vdrive-battery
 
 # Shared generic UEFI shell startup script (runs the single .efi on the
 # vdrive), reused by every per-test vdrive so new service tests don't each
@@ -88,6 +90,9 @@ $(VDRIVE_THERMAL_DIR): build $(THERMAL_EFI) $(STARTUP_NSH)
 $(VDRIVE_TPM_DIR): build $(TPM_EFI) $(STARTUP_NSH)
 	$(call make-vdrive,$(VDRIVE_TPM_DIR),$(TPM_EFI))
 
+$(VDRIVE_BATTERY_DIR): build $(BATTERY_EFI) $(STARTUP_NSH)
+	$(call make-vdrive,$(VDRIVE_BATTERY_DIR),$(BATTERY_EFI))
+
 # ------------------------------------------------------------
 # Run tests with timeout, capture output, report results
 # ------------------------------------------------------------
@@ -130,22 +135,37 @@ endif
 #
 # Caller (top-level Makefile) is responsible for ensuring `ec` and `uefi`
 # are built; this target only runs the e2e check.
+#
+# run-sp-ec-link <vdrive-dir>: launch the EC sidecar + host SP two-QEMU run
+# against the given per-test vdrive. Shared by every two-QEMU service test.
+define run-sp-ec-link
+@$(DC_RUN) -- scripts/test-sp-ec-link.sh \
+	--ec-elf $(EC_BINARY) \
+	--bios-fv-dir $(BIOS_FV_DIR) \
+	--build-dir e2e-tests/Build \
+	--vdrive-dir e2e-tests/$(1) \
+	--coverage-plugin e2e-tests/$(COVERAGE_PLUGIN) \
+	--coverage-log e2e-tests/$(COVERAGE_LOG) \
+	--ec-timeout $(EC_SERIAL_TIMEOUT) \
+	--host-timeout $(QEMU_TIMEOUT) \
+	--serial-tee $(SERIAL_TEE) \
+	-- $(QEMU_COMMON_ARGS)
+endef
+
 .PHONY: test-sp-ec-link
 test-sp-ec-link: $(VDRIVE_THERMAL_DIR) $(COVERAGE_PLUGIN) | builder-image
 	@mkdir -p Build
 	@echo "=== Running two-QEMU Thermal e2e (EC timeout=$(EC_SERIAL_TIMEOUT)s, host timeout=$(QEMU_TIMEOUT)s) ==="
 	$(call GROUP,Two-QEMU Thermal e2e)
-	@$(DC_RUN) -- scripts/test-sp-ec-link.sh \
-		--ec-elf $(EC_BINARY) \
-		--bios-fv-dir $(BIOS_FV_DIR) \
-		--build-dir e2e-tests/Build \
-		--vdrive-dir e2e-tests/$(VDRIVE_THERMAL_DIR) \
-		--coverage-plugin e2e-tests/$(COVERAGE_PLUGIN) \
-		--coverage-log e2e-tests/$(COVERAGE_LOG) \
-		--ec-timeout $(EC_SERIAL_TIMEOUT) \
-		--host-timeout $(QEMU_TIMEOUT) \
-		--serial-tee $(SERIAL_TEE) \
-		-- $(QEMU_COMMON_ARGS)
+	$(call run-sp-ec-link,$(VDRIVE_THERMAL_DIR))
+	$(call ENDGROUP)
+
+.PHONY: test-sp-ec-link-battery
+test-sp-ec-link-battery: $(VDRIVE_BATTERY_DIR) $(COVERAGE_PLUGIN) | builder-image
+	@mkdir -p Build
+	@echo "=== Running two-QEMU Battery e2e (EC timeout=$(EC_SERIAL_TIMEOUT)s, host timeout=$(QEMU_TIMEOUT)s) ==="
+	$(call GROUP,Two-QEMU Battery e2e)
+	$(call run-sp-ec-link,$(VDRIVE_BATTERY_DIR))
 	$(call ENDGROUP)
 
 # ------------------------------------------------------------
