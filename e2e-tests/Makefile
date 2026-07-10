@@ -14,6 +14,7 @@ TARGET_DIR := target/aarch64-unknown-uefi/release
 THERMAL_EFI := $(TARGET_DIR)/thermal.efi
 TPM_EFI := $(TARGET_DIR)/tpm.efi
 BATTERY_EFI := $(TARGET_DIR)/battery.efi
+TIME_ALARM_EFI := $(TARGET_DIR)/time_alarm.efi
 
 # Timeout for QEMU execution (seconds)
 QEMU_TIMEOUT ?= 180
@@ -37,6 +38,7 @@ EC_SERIAL_TIMEOUT  ?= $(QEMU_TIMEOUT)
 VDRIVE_THERMAL_DIR := Build/vdrive-thermal
 VDRIVE_TPM_DIR     := Build/vdrive-tpm
 VDRIVE_BATTERY_DIR := Build/vdrive-battery
+VDRIVE_TIME_ALARM_DIR := Build/vdrive-time-alarm
 
 # Shared generic UEFI shell startup script (runs the single .efi on the
 # vdrive), reused by every per-test vdrive so new service tests don't each
@@ -92,6 +94,9 @@ $(VDRIVE_TPM_DIR): build $(TPM_EFI) $(STARTUP_NSH)
 
 $(VDRIVE_BATTERY_DIR): build $(BATTERY_EFI) $(STARTUP_NSH)
 	$(call make-vdrive,$(VDRIVE_BATTERY_DIR),$(BATTERY_EFI))
+
+$(VDRIVE_TIME_ALARM_DIR): build $(TIME_ALARM_EFI) $(STARTUP_NSH)
+	$(call make-vdrive,$(VDRIVE_TIME_ALARM_DIR),$(TIME_ALARM_EFI))
 
 # ------------------------------------------------------------
 # Run tests with timeout, capture output, report results
@@ -166,6 +171,14 @@ test-sp-ec-link-battery: $(VDRIVE_BATTERY_DIR) $(COVERAGE_PLUGIN) | builder-imag
 	@echo "=== Running two-QEMU Battery e2e (EC timeout=$(EC_SERIAL_TIMEOUT)s, host timeout=$(QEMU_TIMEOUT)s) ==="
 	$(call GROUP,Two-QEMU Battery e2e)
 	$(call run-sp-ec-link,$(VDRIVE_BATTERY_DIR))
+	$(call ENDGROUP)
+
+.PHONY: test-sp-ec-link-time-alarm
+test-sp-ec-link-time-alarm: $(VDRIVE_TIME_ALARM_DIR) $(COVERAGE_PLUGIN) | builder-image
+	@mkdir -p Build
+	@echo "=== Running two-QEMU TimeAlarm e2e (EC timeout=$(EC_SERIAL_TIMEOUT)s, host timeout=$(QEMU_TIMEOUT)s) ==="
+	$(call GROUP,Two-QEMU TimeAlarm e2e)
+	$(call run-sp-ec-link,$(VDRIVE_TIME_ALARM_DIR))
 	$(call ENDGROUP)
 
 # ------------------------------------------------------------

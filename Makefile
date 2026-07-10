@@ -68,6 +68,7 @@ run_ec:
 e2e-test: ec uefi
 	$(MAKE) -C e2e-tests test-sp-ec-link
 	$(MAKE) -C e2e-tests test-sp-ec-link-battery
+	$(MAKE) -C e2e-tests test-sp-ec-link-time-alarm
 	$(MAKE) -C mod secure-services-test
 	$(MAKE) -C mod uefi-only
 	$(MAKE) -C e2e-tests test-sp-services
