@@ -28,7 +28,8 @@ struct Timestamp {
     milliseconds: u16,
     timezone: i16,
     daylight: u8,
-    reserved: [u8; 3],
+    // ACPI wire-reserved bytes, not Rust struct padding.
+    reserved_bytes: [u8; 3],
 }
 
 impl Timestamp {
@@ -44,7 +45,7 @@ impl Timestamp {
             milliseconds: u16::from_le_bytes([payload.u8_at(8), payload.u8_at(9)]),
             timezone: i16::from_le_bytes([payload.u8_at(10), payload.u8_at(11)]),
             daylight: payload.u8_at(12),
-            reserved: [
+            reserved_bytes: [
                 payload.u8_at(ACPI_TIMESTAMP_LEN - 3),
                 payload.u8_at(ACPI_TIMESTAMP_LEN - 2),
                 payload.u8_at(ACPI_TIMESTAMP_LEN - 1),
@@ -67,7 +68,7 @@ impl Timestamp {
             && self.milliseconds < 1000
             && self.timezone == 0
             && self.daylight == 0
-            && self.reserved == [0, 0, 0]
+            && self.reserved_bytes == [0, 0, 0]
     }
 }
 
