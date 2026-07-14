@@ -4,5 +4,5 @@
 #
 
 [workspace]
-members = ["ffa", "uart-logger", "test-support", "tests/thermal", "tests/tpm", "tests/battery"]
+members = ["ffa", "uart-logger", "test-support", "tests/thermal", "tests/tpm", "tests/battery", "tests/time-alarm"]
 resolver = "2"
