@@ -1,4 +1,4 @@
-//! E2E test: Thermal service get_temperature via FF-A Direct Request v2.
+//! E2E test: Thermal command family via FF-A Direct Request v2.
 //!
 //! SPDX-License-Identifier: MIT
 //!
@@ -11,58 +11,176 @@ extern crate alloc;
 use test_support::{run_tests, send_service_command, TestResults, THERMAL_UUID};
 use uefi::prelude::*;
 
-/// EC_THM_GET_TMP opcode.
-const EC_THM_GET_TMP: u8 = 0x01;
+const GET_TMP: u8 = 1;
+const SET_THRS: u8 = 2;
+const GET_THRS: u8 = 3;
+const SET_SCP: u8 = 4;
+const GET_VAR: u8 = 5;
+const SET_VAR: u8 = 6;
 
-/// Mock sensor in dev-qemu sawtooths 20–40 °C, which is
-/// (20+273.15)*10 ≈ 2932 dK .. (40+273.15)*10 ≈ 3132 dK.
-/// Widen by ±~30 dK to absorb sawtooth phase + any
-/// truncation/rounding the EC's sensor stack applies.
-const MIN_DK: u64 = 2900;
-const MAX_DK: u64 = 3200;
+const SENSOR_ID: u8 = 0;
+const MIN_DK: u32 = 2900;
+const MAX_DK: u32 = 3200;
+const WARN_LOW_DK: u32 = 3000;
+const WARN_HIGH_DK: u32 = 3100;
+const CRT_TEMP_DK: u32 = 3500;
+const INVALID_PARAMETER: u32 = 1;
+const VARIABLE_LEN: u16 = 4;
+const CRT_TEMP_UUID: [u8; 16] = uuid::uuid!("218246e7-baf6-45f1-aa13-07e4845256b8").to_bytes_le();
 
 #[entry]
 fn main() -> Status {
-    run_tests(test_thermal_get_temperature)
+    run_tests(test_thermal_command_family)
 }
 
-fn test_thermal_get_temperature(results: &mut TestResults, our_id: u16, ec_id: u16) {
-    // byte 0 = command (EC_THM_GET_TMP), byte 1 = sensor_id
-    let sensor_id: u8 = 0;
-    let resp_payload = match send_service_command(
+fn test_thermal_command_family(results: &mut TestResults, our_id: u16, ec_id: u16) {
+    test_get_temperature(results, our_id, ec_id);
+    test_threshold_round_trip(results, our_id, ec_id);
+    test_variable_round_trip(results, our_id, ec_id);
+    test_set_scp_error(results, our_id, ec_id);
+}
+
+fn test_get_temperature(results: &mut TestResults, our_id: u16, ec_id: u16) {
+    const NAME: &str = "thermal_get_temperature";
+    let Some(response) = send_service_command(
         results,
-        "thermal_get_temperature",
+        NAME,
         our_id,
         ec_id,
         &THERMAL_UUID,
-        EC_THM_GET_TMP,
-        &[sensor_id],
-    ) {
-        Some(p) => p,
-        None => return,
+        GET_TMP,
+        &[SENSOR_ID],
+    ) else {
+        return;
     };
-
-    // Response layout: byte 0..8 = status (i64),
-    // byte 8..16 = temperature (u64; EC u32 LE DeciKelvin zero-extended)
-    let status = resp_payload.u64_at(0) as i64;
-    let temperature = resp_payload.u64_at(8);
-
-    log::info!(
-        "  get_temperature response: status={}, temp={:#x}",
-        status,
-        temperature,
-    );
-
-    if status != 0 {
-        results.fail("thermal_get_temperature", "non-zero status from SP");
-        return;
-    }
+    let temperature = response.u32_at(0);
+    log::info!("  GetTmp: temperature={} dK", temperature);
     if !(MIN_DK..=MAX_DK).contains(&temperature) {
-        results.fail(
-            "thermal_get_temperature",
-            "DeciKelvin out of EC mock-sensor range",
-        );
+        results.fail(NAME, "DeciKelvin outside EC mock range");
         return;
     }
-    results.pass("thermal_get_temperature");
+    results.pass(NAME);
+}
+
+fn test_threshold_round_trip(results: &mut TestResults, our_id: u16, ec_id: u16) {
+    const NAME: &str = "thermal_set_get_threshold";
+    let mut set_args = [0u8; 13];
+    set_args[0] = SENSOR_ID;
+    set_args[1..5].copy_from_slice(&0u32.to_le_bytes());
+    set_args[5..9].copy_from_slice(&WARN_LOW_DK.to_le_bytes());
+    set_args[9..13].copy_from_slice(&WARN_HIGH_DK.to_le_bytes());
+
+    let Some(set_response) = send_service_command(
+        results,
+        NAME,
+        our_id,
+        ec_id,
+        &THERMAL_UUID,
+        SET_THRS,
+        &set_args,
+    ) else {
+        return;
+    };
+    if set_response.u32_at(0) != 0 {
+        results.fail(NAME, "SetThrs returned non-zero status");
+        return;
+    }
+
+    let Some(get_response) = send_service_command(
+        results,
+        NAME,
+        our_id,
+        ec_id,
+        &THERMAL_UUID,
+        GET_THRS,
+        &[SENSOR_ID],
+    ) else {
+        return;
+    };
+    let actual = (
+        get_response.u32_at(0),
+        get_response.u32_at(4),
+        get_response.u32_at(8),
+    );
+    log::info!(
+        "  Set/GetThrs: timeout={} low={} high={}",
+        actual.0,
+        actual.1,
+        actual.2,
+    );
+    if actual != (0, WARN_LOW_DK, WARN_HIGH_DK) {
+        results.fail(NAME, "GetThrs did not return EC-stored thresholds");
+        return;
+    }
+    results.pass(NAME);
+}
+
+fn test_variable_round_trip(results: &mut TestResults, our_id: u16, ec_id: u16) {
+    const NAME: &str = "thermal_set_get_variable";
+    let mut set_args = [0u8; 23];
+    set_args[0] = SENSOR_ID;
+    set_args[1..3].copy_from_slice(&VARIABLE_LEN.to_le_bytes());
+    set_args[3..19].copy_from_slice(&CRT_TEMP_UUID);
+    set_args[19..23].copy_from_slice(&CRT_TEMP_DK.to_le_bytes());
+
+    let Some(set_response) = send_service_command(
+        results,
+        NAME,
+        our_id,
+        ec_id,
+        &THERMAL_UUID,
+        SET_VAR,
+        &set_args,
+    ) else {
+        return;
+    };
+    if set_response.u32_at(0) != 0 {
+        results.fail(NAME, "SetVar returned non-zero status");
+        return;
+    }
+
+    let mut get_args = [0u8; 19];
+    get_args[0] = SENSOR_ID;
+    get_args[1..3].copy_from_slice(&VARIABLE_LEN.to_le_bytes());
+    get_args[3..19].copy_from_slice(&CRT_TEMP_UUID);
+    let Some(get_response) = send_service_command(
+        results,
+        NAME,
+        our_id,
+        ec_id,
+        &THERMAL_UUID,
+        GET_VAR,
+        &get_args,
+    ) else {
+        return;
+    };
+    let value = get_response.u32_at(0);
+    log::info!("  Set/GetVar CRT_TEMP: value={} dK", value);
+    if value != CRT_TEMP_DK {
+        results.fail(NAME, "GetVar did not return EC-stored CRT_TEMP");
+        return;
+    }
+    results.pass(NAME);
+}
+
+fn test_set_scp_error(results: &mut TestResults, our_id: u16, ec_id: u16) {
+    const NAME: &str = "thermal_set_scp_invalid_parameter";
+    let mut args = [0u8; 13];
+    args[0] = SENSOR_ID;
+    args[1..5].copy_from_slice(&1u32.to_le_bytes());
+    args[5..9].copy_from_slice(&75u32.to_le_bytes());
+    args[9..13].copy_from_slice(&25u32.to_le_bytes());
+
+    let Some(response) =
+        send_service_command(results, NAME, our_id, ec_id, &THERMAL_UUID, SET_SCP, &args)
+    else {
+        return;
+    };
+    let status = response.u32_at(0);
+    log::info!("  SetScp: status={}", status);
+    if status != INVALID_PARAMETER {
+        results.fail(NAME, "SetScp did not return EC InvalidParameter");
+        return;
+    }
+    results.pass(NAME);
 }
