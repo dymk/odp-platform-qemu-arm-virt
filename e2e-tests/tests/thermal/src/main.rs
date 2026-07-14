@@ -11,12 +11,21 @@ extern crate alloc;
 use test_support::{run_tests, send_service_command, TestResults, THERMAL_UUID};
 use uefi::prelude::*;
 
-const GET_TMP: u8 = 1;
-const SET_THRS: u8 = 2;
-const GET_THRS: u8 = 3;
-const SET_SCP: u8 = 4;
-const GET_VAR: u8 = 5;
-const SET_VAR: u8 = 6;
+#[repr(u8)]
+enum ThermalCommand {
+    GetTmp = 1,
+    SetThrs = 2,
+    GetThrs = 3,
+    SetScp = 4,
+    GetVar = 5,
+    SetVar = 6,
+}
+
+impl From<ThermalCommand> for u8 {
+    fn from(command: ThermalCommand) -> Self {
+        command as Self
+    }
+}
 
 const SENSOR_ID: u8 = 0;
 const MIN_DK: u32 = 2900;
@@ -48,7 +57,7 @@ fn test_get_temperature(results: &mut TestResults, our_id: u16, ec_id: u16) {
         our_id,
         ec_id,
         &THERMAL_UUID,
-        GET_TMP,
+        ThermalCommand::GetTmp.into(),
         &[SENSOR_ID],
     ) else {
         return;
@@ -76,7 +85,7 @@ fn test_threshold_round_trip(results: &mut TestResults, our_id: u16, ec_id: u16)
         our_id,
         ec_id,
         &THERMAL_UUID,
-        SET_THRS,
+        ThermalCommand::SetThrs.into(),
         &set_args,
     ) else {
         return;
@@ -92,7 +101,7 @@ fn test_threshold_round_trip(results: &mut TestResults, our_id: u16, ec_id: u16)
         our_id,
         ec_id,
         &THERMAL_UUID,
-        GET_THRS,
+        ThermalCommand::GetThrs.into(),
         &[SENSOR_ID],
     ) else {
         return;
@@ -129,7 +138,7 @@ fn test_variable_round_trip(results: &mut TestResults, our_id: u16, ec_id: u16) 
         our_id,
         ec_id,
         &THERMAL_UUID,
-        SET_VAR,
+        ThermalCommand::SetVar.into(),
         &set_args,
     ) else {
         return;
@@ -149,7 +158,7 @@ fn test_variable_round_trip(results: &mut TestResults, our_id: u16, ec_id: u16) 
         our_id,
         ec_id,
         &THERMAL_UUID,
-        GET_VAR,
+        ThermalCommand::GetVar.into(),
         &get_args,
     ) else {
         return;
@@ -171,9 +180,15 @@ fn test_set_scp_error(results: &mut TestResults, our_id: u16, ec_id: u16) {
     args[5..9].copy_from_slice(&75u32.to_le_bytes());
     args[9..13].copy_from_slice(&25u32.to_le_bytes());
 
-    let Some(response) =
-        send_service_command(results, NAME, our_id, ec_id, &THERMAL_UUID, SET_SCP, &args)
-    else {
+    let Some(response) = send_service_command(
+        results,
+        NAME,
+        our_id,
+        ec_id,
+        &THERMAL_UUID,
+        ThermalCommand::SetScp.into(),
+        &args,
+    ) else {
         return;
     };
     let status = response.u32_at(0);
