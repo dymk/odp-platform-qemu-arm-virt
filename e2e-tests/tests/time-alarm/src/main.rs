@@ -1,4 +1,4 @@
-//! E2E test: TimeAlarm GetRealTime via FF-A Direct Request v2.
+//! E2E test: TimeAlarm real-time and timer set/get via FF-A Direct Request v2.
 //!
 //! SPDX-License-Identifier: MIT
 //!
