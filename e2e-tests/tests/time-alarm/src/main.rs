@@ -12,7 +12,24 @@ use ffa::DirectMessagePayload;
 use test_support::{run_tests, send_service_command, TestResults, TIME_ALARM_UUID};
 use uefi::{boot, prelude::*};
 
-const GET_REAL_TIME: u8 = 2;
+#[repr(u8)]
+enum TimeAlarmCommand {
+    GetRealTime = 2,
+    SetTimerValue = 6,
+    GetTimerValue = 7,
+}
+
+impl From<TimeAlarmCommand> for u8 {
+    fn from(command: TimeAlarmCommand) -> Self {
+        command as Self
+    }
+}
+
+const AC_TIMER_ID: u32 = 0;
+const TIMER_SECONDS: u32 = 300;
+const MIN_INITIAL_SECONDS: u32 = 290;
+const MIN_COUNTDOWN_DELTA: u32 = 2;
+const MAX_COUNTDOWN_DELTA: u32 = 6;
 const STALL_MICROSECONDS: usize = 3_000_000;
 const ACPI_TIMESTAMP_LEN: usize = 16;
 
@@ -74,7 +91,12 @@ impl Timestamp {
 
 #[entry]
 fn main() -> Status {
-    run_tests(test_get_real_time)
+    run_tests(test_time_alarm_command_family)
+}
+
+fn test_time_alarm_command_family(results: &mut TestResults, our_id: u16, ec_id: u16) {
+    test_get_real_time(results, our_id, ec_id);
+    test_timer_value_round_trip(results, our_id, ec_id);
 }
 
 fn get_real_time(results: &mut TestResults, our_id: u16, ec_id: u16) -> Option<Timestamp> {
@@ -84,10 +106,29 @@ fn get_real_time(results: &mut TestResults, our_id: u16, ec_id: u16) -> Option<T
         our_id,
         ec_id,
         &TIME_ALARM_UUID,
-        GET_REAL_TIME,
+        TimeAlarmCommand::GetRealTime.into(),
         &[],
     )?;
     Some(Timestamp::parse(&payload))
+}
+
+fn get_timer_value(
+    results: &mut TestResults,
+    test_name: &str,
+    our_id: u16,
+    ec_id: u16,
+) -> Option<u32> {
+    let args = AC_TIMER_ID.to_le_bytes();
+    let payload = send_service_command(
+        results,
+        test_name,
+        our_id,
+        ec_id,
+        &TIME_ALARM_UUID,
+        TimeAlarmCommand::GetTimerValue.into(),
+        &args,
+    )?;
+    Some(payload.u32_at(0))
 }
 
 fn test_get_real_time(results: &mut TestResults, our_id: u16, ec_id: u16) {
@@ -143,4 +184,60 @@ fn test_get_real_time(results: &mut TestResults, our_id: u16, ec_id: u16) {
     }
 
     results.pass("time_alarm_get_real_time");
+}
+
+fn test_timer_value_round_trip(results: &mut TestResults, our_id: u16, ec_id: u16) {
+    const NAME: &str = "time_alarm_timer_set_get";
+
+    let mut set_args = [0u8; 8];
+    set_args[..4].copy_from_slice(&AC_TIMER_ID.to_le_bytes());
+    set_args[4..].copy_from_slice(&TIMER_SECONDS.to_le_bytes());
+    let Some(set_response) = send_service_command(
+        results,
+        NAME,
+        our_id,
+        ec_id,
+        &TIME_ALARM_UUID,
+        TimeAlarmCommand::SetTimerValue.into(),
+        &set_args,
+    ) else {
+        return;
+    };
+    let status = set_response.u32_at(0);
+    if status != 0 {
+        results.fail(NAME, "SetTimerValue returned non-zero status");
+        return;
+    }
+
+    let Some(first) = get_timer_value(results, NAME, our_id, ec_id) else {
+        return;
+    };
+    if !(MIN_INITIAL_SECONDS..=TIMER_SECONDS).contains(&first) {
+        results.fail(NAME, "initial timer value outside 290..=300 seconds");
+        return;
+    }
+
+    boot::stall(STALL_MICROSECONDS);
+
+    let Some(second) = get_timer_value(results, NAME, our_id, ec_id) else {
+        return;
+    };
+    let Some(delta) = first.checked_sub(second) else {
+        results.fail(NAME, "EC timer value increased");
+        return;
+    };
+
+    log::info!(
+        "  Set/GetTimerValue: first={}s second={}s delta={}s",
+        first,
+        second,
+        delta,
+    );
+
+    if !(MIN_COUNTDOWN_DELTA..=MAX_COUNTDOWN_DELTA).contains(&delta) {
+        results.fail(NAME, "EC timer delta outside 2..=6 seconds");
+        return;
+    }
+
+    results.pass(NAME);
 }
