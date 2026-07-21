@@ -205,6 +205,7 @@ fn test_timer_value_round_trip(results: &mut TestResults, our_id: u16, ec_id: u1
     };
     let status = set_response.u32_at(0);
     if status != 0 {
+        log::error!("  SetTimerValue: status={}", status);
         results.fail(NAME, "SetTimerValue returned non-zero status");
         return;
     }
@@ -213,6 +214,12 @@ fn test_timer_value_round_trip(results: &mut TestResults, our_id: u16, ec_id: u1
         return;
     };
     if !(MIN_INITIAL_SECONDS..=TIMER_SECONDS).contains(&first) {
+        log::error!(
+            "  GetTimerValue: initial={}s expected={}..={}s",
+            first,
+            MIN_INITIAL_SECONDS,
+            TIMER_SECONDS,
+        );
         results.fail(NAME, "initial timer value outside 290..=300 seconds");
         return;
     }
@@ -223,6 +230,11 @@ fn test_timer_value_round_trip(results: &mut TestResults, our_id: u16, ec_id: u1
         return;
     };
     let Some(delta) = first.checked_sub(second) else {
+        log::error!(
+            "  GetTimerValue: first={}s second={}s (timer increased)",
+            first,
+            second,
+        );
         results.fail(NAME, "EC timer value increased");
         return;
     };
