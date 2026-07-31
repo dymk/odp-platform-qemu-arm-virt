@@ -51,9 +51,19 @@ fn main() -> Status {
 }
 
 fn test_ucsi_command_family(ctx: &mut E2eContext) {
+    test_ucsi_partition_discovery(ctx);
     test_get_capability(ctx);
     test_get_connector_capability(ctx);
     test_get_connector_status(ctx);
+}
+
+fn test_ucsi_partition_discovery(ctx: &mut E2eContext) {
+    const NAME: &str = "ucsi_partition_discovery";
+    match ffa::ffa_partition_info_get_regs(&UCSI_UUID) {
+        Ok((count, _)) if count > 0 => ctx.pass(NAME),
+        Ok(_) => ctx.fail(NAME, "UCSI UUID is not advertised by any partition"),
+        Err(_) => ctx.fail(NAME, "PARTITION_INFO_GET_REGS failed for UCSI UUID"),
+    }
 }
 
 /// Send one UCSI command: `[DOORBELL] + 48-byte mailbox` with `opcode` at
