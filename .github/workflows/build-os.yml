@@ -110,6 +110,20 @@ jobs:
           $ProgressPreference = 'SilentlyContinue'
           Invoke-WebRequest 'https://aka.ms/DownloadValidationOS_arm64' -OutFile 'ValidationOS.iso'
 
+      - name: Download UCSI smoke app
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP 'ec-test-apps-ARM64.zip'
+          $dest = Join-Path $env:RUNNER_TEMP 'ucsi-smoke-app'
+          gh release download latest --repo dymk/odp-platform-common --pattern 'ec-test-apps-ARM64.zip' --dir $env:RUNNER_TEMP --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to download UCSI smoke app' }
+          if (Test-Path $dest) { Remove-Item -Path $dest -Recurse -Force }
+          Expand-Archive -Path $zip -DestinationPath $dest -Force
+          $app = Get-ChildItem -Path $dest -Recurse -Filter 'ec-test-tui.exe' -File | Select-Object -First 1
+          if (-not $app) { throw 'UCSI smoke executable not found in app archive' }
+          "UCSI_SMOKE_APP=$($app.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       - name: Build WIM
         run: |
           $mount = Mount-DiskImage -ImagePath (Resolve-Path ValidationOS.iso).Path -PassThru
@@ -215,7 +229,7 @@ jobs:
 
             foreach ($infPath in $infPaths) {
               Write-Host "Injecting driver $($infPath.FullName)"
-              dism.exe /Image:$mountPath /Add-Driver /Driver:$($infPath.FullName)
+              dism.exe /Image:$mountPath /Add-Driver /Driver:$($infPath.FullName) /ForceUnsigned
               if ($LASTEXITCODE -ne 0) { throw "Failed to add driver $($infPath.FullName) with exit code $LASTEXITCODE" }
             }
 
@@ -271,6 +285,14 @@ jobs:
             New-Item -Path $acpiTargetDir -ItemType Directory -Force | Out-Null
             Copy-Item -Path $env:ACPITABL_DAT_PATH -Destination (Join-Path $acpiTargetDir 'ACPITABL.dat') -Force
             Write-Host "Copied ACPITABL.dat to ${acpiTargetDir}"
+
+            if (-not $env:UCSI_SMOKE_APP -or -not (Test-Path $env:UCSI_SMOKE_APP)) {
+              throw 'UCSI_SMOKE_APP is missing'
+            }
+            $smokeDir = "${osLetter}:\ucsi-smoke"
+            New-Item -Path $smokeDir -ItemType Directory -Force | Out-Null
+            Copy-Item -Path $env:UCSI_SMOKE_APP -Destination (Join-Path $smokeDir 'ucsi-smoke.exe') -Force
+            Write-Host "Copied UCSI smoke executable to ${smokeDir}"
 
             Write-Host "Creating boot files on ${efiLetter}:\"
             bcdboot "${osLetter}:\Windows" /s "${efiLetter}:" /f UEFI
