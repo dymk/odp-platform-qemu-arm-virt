@@ -33,8 +33,6 @@ DefinitionBlock ("SsdtEc.aml", "SSDT", 2, "QEMUAR", "EC      ", 1) {
       Return(Arg0) // Echo back input
     }
 
-    Name(UMBX, Buffer(48){})    // UCSI mailbox carried inline in the FF-A payload
-
     // USND — route a UCSI command through the FF-A doorbell (FFA0.FFAC).
     // Arg0: 8-byte CONTROL buffer (opcode @0, connector @2). The 144-byte
     // BUFF is the FF-A envelope: status @0, service UUID @bit128, doorbell
@@ -45,16 +43,15 @@ DefinitionBlock ("SsdtEc.aml", "SSDT", 2, "QEMUAR", "EC      ", 1) {
       CreateDwordField(BUFF, 0, STAT)     // Out - FF-A status
       CreateField(BUFF, 128, 128, UUID)   // Service UUID
       CreateByteField(BUFF, 32, CMDD)     // In  - doorbell tag
-      CreateField(BUFF, 264, 384, WMBX)   // In  - request mailbox (payload byte 1)
       CreateField(BUFF, 256, 384, RMBX)   // Out - response mailbox (payload byte 0)
-      CreateByteField(UMBX, 8, UC00)      // CONTROL bytes at mailbox offset 8
-      CreateByteField(UMBX, 9, UC01)
-      CreateByteField(UMBX, 10, UC02)
-      CreateByteField(UMBX, 11, UC03)
-      CreateByteField(UMBX, 12, UC04)
-      CreateByteField(UMBX, 13, UC05)
-      CreateByteField(UMBX, 14, UC06)
-      CreateByteField(UMBX, 15, UC07)
+      CreateByteField(BUFF, 41, UC00)     // Request CONTROL at payload byte 9
+      CreateByteField(BUFF, 42, UC01)
+      CreateByteField(BUFF, 43, UC02)
+      CreateByteField(BUFF, 44, UC03)
+      CreateByteField(BUFF, 45, UC04)
+      CreateByteField(BUFF, 46, UC05)
+      CreateByteField(BUFF, 47, UC06)
+      CreateByteField(BUFF, 48, UC07)
 
       Store(DerefOf(Index(Arg0, 0)), UC00)
       Store(DerefOf(Index(Arg0, 1)), UC01)
@@ -65,7 +62,6 @@ DefinitionBlock ("SsdtEc.aml", "SSDT", 2, "QEMUAR", "EC      ", 1) {
       Store(DerefOf(Index(Arg0, 6)), UC06)
       Store(DerefOf(Index(Arg0, 7)), UC07)
       Store(0x00, CMDD)
-      Store(UMBX, WMBX)
       Store(ToUUID("65467f50-827f-4e4f-8770-dbf4c3f77f45"), UUID)
 
       Store(Store(BUFF, \_SB_.FFA0.FFAC), BUFF)
