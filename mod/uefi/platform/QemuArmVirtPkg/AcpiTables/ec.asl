@@ -47,9 +47,23 @@ DefinitionBlock ("SsdtEc.aml", "SSDT", 2, "QEMUAR", "EC      ", 1) {
       CreateByteField(BUFF, 32, CMDD)     // In  - doorbell tag
       CreateField(BUFF, 264, 384, WMBX)   // In  - request mailbox (payload byte 1)
       CreateField(BUFF, 256, 384, RMBX)   // Out - response mailbox (payload byte 0)
-      CreateField(UMBX, 64, 64, UCTL)     // CONTROL at mailbox offset 8
+      CreateByteField(UMBX, 8, UC00)      // CONTROL bytes at mailbox offset 8
+      CreateByteField(UMBX, 9, UC01)
+      CreateByteField(UMBX, 10, UC02)
+      CreateByteField(UMBX, 11, UC03)
+      CreateByteField(UMBX, 12, UC04)
+      CreateByteField(UMBX, 13, UC05)
+      CreateByteField(UMBX, 14, UC06)
+      CreateByteField(UMBX, 15, UC07)
 
-      Store(Arg0, UCTL)
+      Store(DerefOf(Index(Arg0, 0)), UC00)
+      Store(DerefOf(Index(Arg0, 1)), UC01)
+      Store(DerefOf(Index(Arg0, 2)), UC02)
+      Store(DerefOf(Index(Arg0, 3)), UC03)
+      Store(DerefOf(Index(Arg0, 4)), UC04)
+      Store(DerefOf(Index(Arg0, 5)), UC05)
+      Store(DerefOf(Index(Arg0, 6)), UC06)
+      Store(DerefOf(Index(Arg0, 7)), UC07)
       Store(0x00, CMDD)
       Store(UMBX, WMBX)
       Store(ToUUID("65467f50-827f-4e4f-8770-dbf4c3f77f45"), UUID)
