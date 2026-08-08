@@ -518,10 +518,12 @@ expect_not_contains "workflow has no smoke repo input" "$WORKFLOW" '^[[:space:]]
 expect_not_contains "workflow has no smoke release input" "$WORKFLOW" '^[[:space:]]+smoke_release:'
 expect_not_contains "workflow does not download ec-test-tui release" "$WORKFLOW" \
     'ec-test-apps-ARM64|ec-test-tui\.exe|gh release download.*SMOKE'
-expect_contains "workflow installs pinned Rust 1.88" "$WORKFLOW" \
-    'rustup toolchain install 1\.88\.0'
+expect_contains "workflow installs pinned Rust 1.90" "$WORKFLOW" \
+    'rustup toolchain install 1\.90\.0'
 expect_contains "workflow builds dedicated smoke crate locked" "$WORKFLOW" \
-    'cargo \+1\.88\.0 build --locked --release --target aarch64-pc-windows-msvc'
+    'cargo \+1\.90\.0 build --locked --release --target aarch64-pc-windows-msvc'
+expect_not_contains "workflow honors smoke crate rust-version" "$WORKFLOW" \
+    '--ignore-rust-version'
 expect_contains "workflow copies dedicated smoke binary" "$WORKFLOW" \
     "ucsi-smoke[/\\\\]target[/\\\\]aarch64-pc-windows-msvc[/\\\\]release[/\\\\]ucsi-smoke\\.exe"
 expect_not_contains "PowerShell does not quote expressions into source" "$WORKFLOW" \
@@ -530,7 +532,8 @@ expect_not_contains "PowerShell does not quote expressions into source" "$WORKFL
 expect_contains "smoke crate is isolated from parent workspaces" "$SMOKE_MANIFEST" '^\[workspace\]'
 expect_contains "smoke crate pins exact platform-common revision" "$SMOKE_MANIFEST" \
     'git = "https://github\.com/dymk/odp-platform-common\.git".*rev = "53c3b6bce6d8f8c359ff0ded9884232d481ee7b1"'
-expect_contains "smoke crate pins Rust 1.88" "$SMOKE_DIR/rust-toolchain.toml" 'channel = "1\.88\.0"'
+expect_contains "smoke crate pins Rust 1.90" "$SMOKE_DIR/rust-toolchain.toml" 'channel = "1\.90\.0"'
+expect_contains "smoke crate declares Rust 1.90" "$SMOKE_MANIFEST" 'rust-version = "1\.90"'
 expect_pass "smoke crate commits a lockfile" test -f "$SMOKE_LOCK"
 expect_contains "Windows smoke uses ACPI transport" "$SMOKE_SOURCE" 'ec_test_lib::acpi::Acpi'
 expect_contains "Windows smoke validates UCSI VERSION 0x0120" "$SMOKE_SOURCE" \

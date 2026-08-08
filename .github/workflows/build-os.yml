@@ -247,8 +247,8 @@ jobs:
 
       - name: Build UCSI smoke app
         run: |
-          rustup toolchain install 1.88.0 --profile minimal --target aarch64-pc-windows-msvc
-          cargo +1.88.0 build --locked --release --target aarch64-pc-windows-msvc --ignore-rust-version --manifest-path postbuild/os/ucsi-smoke/Cargo.toml
+          rustup toolchain install 1.90.0 --profile minimal --target aarch64-pc-windows-msvc
+          cargo +1.90.0 build --locked --release --target aarch64-pc-windows-msvc --manifest-path postbuild/os/ucsi-smoke/Cargo.toml
           if ($LASTEXITCODE -ne 0) { throw "UCSI smoke build failed with exit code $LASTEXITCODE" }
           $app = Resolve-Path 'postbuild\os\ucsi-smoke\target\aarch64-pc-windows-msvc\release\ucsi-smoke.exe'
           "UCSI_SMOKE_APP=$app" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
