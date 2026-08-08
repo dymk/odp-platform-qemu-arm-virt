@@ -3,10 +3,7 @@
 	url = https://github.com/OpenDevicePartnership/patina-qemu.git
 [submodule "odp-secure-services"]
 	path = mod/secure-services/odp-secure-services
-	# TODO: restore to OpenDevicePartnership URL before merging. Points at the
-	# dymk fork to fetch the secure-world UCSI stub (commit 4c8de73, fork PR
-	# dymk/odp-secure-services#13) which is not yet on the upstream org repo.
-	url = https://github.com/dymk/odp-secure-services.git
+	url = https://github.com/OpenDevicePartnership/odp-secure-services.git
 [submodule "odp-embedded-controller"]
 	path = mod/ec
 	url = https://github.com/OpenDevicePartnership/odp-embedded-controller.git
