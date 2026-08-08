@@ -15,6 +15,7 @@ PROD="$(cd "$SCRIPT_DIR/.." && pwd)/run-ucsi-windows-e2e.sh"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 WORKFLOW="$REPO_ROOT/.github/workflows/build-os.yml"
 DOCKERFILE="$REPO_ROOT/.devcontainer/Dockerfile"
+OS_README="$REPO_ROOT/postbuild/os/README.md"
 SMOKE_DIR="$REPO_ROOT/postbuild/os/ucsi-smoke"
 SMOKE_MANIFEST="$SMOKE_DIR/Cargo.toml"
 SMOKE_LOCK="$SMOKE_DIR/Cargo.lock"
@@ -476,7 +477,7 @@ expect_fail "outside cache rejected" ucsi_path_within_repo "$PATH_TMP/outside" "
 rm -rf "$PATH_TMP"
 
 # =====================================================================
-# (m) overlay cleanup and guestfish command selection
+# (m) overlay cleanup and rootless guestfish kernel selection
 # =====================================================================
 echo "== failure-preservation =="
 assert_have_fn ucsi_should_delete_overlay
@@ -484,12 +485,51 @@ expect_fail "failed run preserves overlay" ucsi_should_delete_overlay 0 0
 expect_pass "verified success deletes overlay" ucsi_should_delete_overlay 1 0
 expect_fail "explicit keep preserves successful overlay" ucsi_should_delete_overlay 1 1
 
-echo "== guestfish-selection =="
-assert_have_fn ucsi_guestfish_command_for_euid
-expect_eq "root uses guestfish directly" "guestfish" \
-    "$(ucsi_guestfish_command_for_euid 0 2>/dev/null || true)"
-expect_eq "non-root uses passwordless sudo" "sudo -n guestfish" \
-    "$(ucsi_guestfish_command_for_euid 1000 2>/dev/null || true)"
+echo "== guestfish-kernel-selection =="
+assert_have_fn ucsi_kernel_cache_path
+KERNEL_TMP="$SCRIPT_DIR/.tmp-guestfish-kernel-$$"
+mkdir -p "$KERNEL_TMP/cache" "$KERNEL_TMP/files"
+expected_kernel_cache="$KERNEL_TMP/cache/libguestfs/kernels/6.8.0-test/vmlinuz-6.8.0-test"
+expect_eq "kernel cache is keyed by the running release" "$expected_kernel_cache" \
+    "$(ucsi_kernel_cache_path "$KERNEL_TMP/cache" 6.8.0-test 2>/dev/null || true)"
+expect_fail "kernel cache rejects an empty release" \
+    ucsi_kernel_cache_path "$KERNEL_TMP/cache" ""
+expect_fail "kernel cache rejects release path traversal" \
+    ucsi_kernel_cache_path "$KERNEL_TMP/cache" ../../escape
+
+assert_have_fn ucsi_select_supermin_kernel
+printf 'system-kernel' > "$KERNEL_TMP/files/system"
+printf 'cached-kernel' > "$KERNEL_TMP/files/cached"
+expect_eq "readable running kernel is preferred" "$KERNEL_TMP/files/system" \
+    "$(ucsi_select_supermin_kernel \
+        "$KERNEL_TMP/files/system" "$KERNEL_TMP/files/cached" 2>/dev/null || true)"
+chmod 000 "$KERNEL_TMP/files/system"
+expect_eq "user-owned cached kernel is reused" "$KERNEL_TMP/files/cached" \
+    "$(ucsi_select_supermin_kernel \
+        "$KERNEL_TMP/files/system" "$KERNEL_TMP/files/cached" 2>/dev/null || true)"
+: > "$KERNEL_TMP/files/cached"
+expect_fail "empty cached kernel is rejected" \
+    ucsi_select_supermin_kernel "$KERNEL_TMP/files/system" "$KERNEL_TMP/files/cached"
+rm -rf "$KERNEL_TMP"
+
+assert_have_fn ucsi_kernel_package_name
+expect_eq "running kernel maps to its Debian image package" \
+    "linux-image-6.8.0-test" "$(ucsi_kernel_package_name 6.8.0-test 2>/dev/null || true)"
+
+assert_have_fn ucsi_find_extracted_kernel
+mkdir -p "$SCRIPT_DIR/.tmp-extracted-kernel-$$/usr/lib"
+printf 'extracted-kernel' \
+    > "$SCRIPT_DIR/.tmp-extracted-kernel-$$/usr/lib/vmlinuz-6.8.0-test"
+expect_eq "matching extracted kernel is located below the package root" \
+    "$SCRIPT_DIR/.tmp-extracted-kernel-$$/usr/lib/vmlinuz-6.8.0-test" \
+    "$(ucsi_find_extracted_kernel \
+        "$SCRIPT_DIR/.tmp-extracted-kernel-$$" 6.8.0-test 2>/dev/null || true)"
+mkdir -p "$SCRIPT_DIR/.tmp-extracted-kernel-$$/boot"
+printf 'duplicate-kernel' \
+    > "$SCRIPT_DIR/.tmp-extracted-kernel-$$/boot/vmlinuz-6.8.0-test"
+expect_fail "ambiguous extracted kernels are rejected" \
+    ucsi_find_extracted_kernel "$SCRIPT_DIR/.tmp-extracted-kernel-$$" 6.8.0-test
+rm -rf "$SCRIPT_DIR/.tmp-extracted-kernel-$$"
 
 # =====================================================================
 # (n) workflow, smoke crate, and devcontainer contracts
@@ -568,6 +608,24 @@ expect_contains "smoke typing failure is guarded" "$PROD" \
 expect_not_contains "runner help has no smoke repo option" "$PROD" 'smoke-repo'
 expect_not_contains "runner help has no smoke release option" "$PROD" 'smoke-release'
 expect_contains "runner exposes drivers release option" "$PROD" 'drivers-release'
+expect_not_contains "runner has no sudo references" "$PROD" 'sudo|passwordless'
+expect_not_contains "UCSI README has no sudo references" "$OS_README" 'sudo|passwordless'
+HELP_TMP="$SCRIPT_DIR/.tmp-help-$$"
+bash "$PROD" --help > "$HELP_TMP" 2>&1
+expect_not_contains "runner help has no sudo references" "$HELP_TMP" 'sudo|passwordless'
+expect_contains "runner help documents automatic rootless kernel caching" "$HELP_TMP" \
+    'rootless.*kernel cache|kernel cache.*rootless'
+rm -f "$HELP_TMP"
+expect_contains "runner prepares rootless guestfish" "$PROD" \
+    'ucsi_prepare_guestfish'
+expect_contains "runner exports the supermin kernel" "$PROD" \
+    'export SUPERMIN_KERNEL'
+expect_contains "runner exports the matching module tree" "$PROD" \
+    'export SUPERMIN_MODULES'
+expect_contains "guestfish preflight boots a tiny prepared disk and queries it" "$PROD" \
+    'guestfish -N "\$image=disk:1M" list-devices'
+expect_contains "guest result extraction invokes plain guestfish" "$PROD" \
+    '^[[:space:]]*guestfish --ro -a "\$overlay" -i'
 
 # =====================================================================
 echo

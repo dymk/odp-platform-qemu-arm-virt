@@ -324,12 +324,46 @@ ucsi_should_delete_overlay() {
     [ "$verified_success" = "1" ] && [ "$keep_requested" = "0" ]
 }
 
-ucsi_guestfish_command_for_euid() {
-    if [ "$1" = "0" ]; then
-        printf 'guestfish\n'
-    else
-        printf 'sudo -n guestfish\n'
-    fi
+ucsi_validate_kernel_release() {
+    local release="${1-}"
+    [[ "$release" =~ ^[A-Za-z0-9][A-Za-z0-9._+~-]*$ ]]
+}
+
+ucsi_kernel_cache_path() {
+    local cache_dir="${1-}" release="${2-}"
+    [ -n "$cache_dir" ] && ucsi_validate_kernel_release "$release" || return 1
+    printf '%s/libguestfs/kernels/%s/vmlinuz-%s\n' "$cache_dir" "$release" "$release"
+}
+
+ucsi_select_supermin_kernel() {
+    local candidate
+    for candidate in "${1-}" "${2-}"; do
+        if [ -n "$candidate" ] && [ -s "$candidate" ] && [ -r "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+ucsi_kernel_package_name() {
+    local release="${1-}"
+    ucsi_validate_kernel_release "$release" || return 1
+    printf 'linux-image-%s\n' "$release"
+}
+
+ucsi_find_extracted_kernel() {
+    local root="${1-}" release="${2-}"
+    local candidates=()
+    [ -d "$root" ] && ucsi_validate_kernel_release "$release" || return 1
+    mapfile -d '' -t candidates < <(
+        find "$root" -type f -name "vmlinuz-$release" -print0
+    )
+    [ "${#candidates[@]}" -eq 1 ] \
+        && [ -s "${candidates[0]}" ] \
+        && [ -r "${candidates[0]}" ] \
+        || return 1
+    printf '%s\n' "${candidates[0]}"
 }
 
 # ucsi_relative_backing_path OVERLAY_PATH BASE_PATH
@@ -373,8 +407,10 @@ Options:
   --keep-run-image              Keep the disposable overlay after the run.
   --help                        Show this help.
 
-Requires: gh (authenticated), git, qemu-img, guestfish, devcontainer, timeout.
-Non-root users also require passwordless `sudo -n guestfish`.
+Requires: gh (authenticated), git, qemu-img, guestfish, supermin, devcontainer,
+          and timeout. If the running kernel is unreadable, Debian/Ubuntu hosts
+          also require apt (or apt-get) and dpkg-deb. The runner automatically
+          maintains a rootless kernel cache below --cache-dir for supermin.
 Runs no dry-run/fake-success mode; a real >= 28000 image is required to pass.
 EOF
 }
@@ -433,24 +469,150 @@ ucsi_require_devcontainer_tools() {
     fi
 }
 
-ucsi_select_guestfish() {
-    local command
-    command="$(ucsi_guestfish_command_for_euid "$EUID")"
-    if [ "$command" = "guestfish" ]; then
-        command -v guestfish >/dev/null 2>&1 \
-            || ucsi_die "guestfish is required for result extraction"
-        guestfish --version >/dev/null 2>&1 \
-            || ucsi_die "guestfish is installed but unusable"
-        UCSI_GUESTFISH_CMD=(guestfish)
-        return
+ucsi_is_debian_family() {
+    local id id_like
+    [ -r /etc/os-release ] || return 1
+    id="$(sed -n 's/^ID=//p' /etc/os-release | tr -d '"' | head -n1)"
+    id_like="$(sed -n 's/^ID_LIKE=//p' /etc/os-release | tr -d '"' | head -n1)"
+    case " $id $id_like " in
+        *" debian "*|*" ubuntu "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+ucsi_apt_download_command() {
+    if command -v apt >/dev/null 2>&1; then
+        printf 'apt\n'
+    elif command -v apt-get >/dev/null 2>&1; then
+        printf 'apt-get\n'
+    else
+        return 1
+    fi
+}
+
+ucsi_remove_guestfish_work_dir() {
+    local work_dir temp_root
+    work_dir="$(realpath -m -- "$1")" || return 1
+    temp_root="$(realpath -m -- "$2")" || return 1
+    case "$work_dir" in
+        "$temp_root"/prepare-*) rm -rf -- "$work_dir" ;;
+        *) return 1 ;;
+    esac
+}
+
+ucsi_cache_running_kernel() {
+    local cache_dir="$1" release="$2" cache_file="$3"
+    local downloader package kernel_root temp_root work_dir publish_tmp=""
+    local extracted_kernel packages
+
+    ucsi_is_debian_family \
+        || ucsi_die "the running kernel is unreadable and automatic kernel extraction is supported only on Debian/Ubuntu"
+    downloader="$(ucsi_apt_download_command)" \
+        || ucsi_die "the running kernel is unreadable; install apt (or apt-get) to populate the rootless kernel cache"
+    command -v dpkg-deb >/dev/null 2>&1 \
+        || ucsi_die "the running kernel is unreadable; install dpkg-deb to populate the rootless kernel cache"
+
+    package="$(ucsi_kernel_package_name "$release")" \
+        || ucsi_die "unsupported running kernel release: $release"
+    kernel_root="$cache_dir/libguestfs"
+    mkdir -p -- "$(dirname "$cache_file")" "$kernel_root/tmp"
+    kernel_root="$(realpath -e -- "$kernel_root")" \
+        || ucsi_die "could not resolve libguestfs cache directory"
+    ucsi_path_within_repo "$kernel_root" "$cache_dir" \
+        || ucsi_die "libguestfs cache escaped the runner cache directory"
+    temp_root="$(realpath -e -- "$kernel_root/tmp")" \
+        || ucsi_die "could not resolve libguestfs temporary directory"
+    work_dir="$temp_root/prepare-$release-$$-$RANDOM"
+    mkdir -- "$work_dir"
+    work_dir="$(realpath -e -- "$work_dir")" \
+        || ucsi_die "could not resolve libguestfs kernel work directory"
+
+    (
+        set -e
+        trap 'rm -f -- "$publish_tmp"; ucsi_remove_guestfish_work_dir "$work_dir" "$temp_root"' EXIT
+        trap 'exit 129' HUP
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+
+        mkdir -- "$work_dir/packages" "$work_dir/extracted"
+        ucsi_log "caching a user-owned $release kernel for rootless guestfish"
+        (
+            cd "$work_dir/packages"
+            "$downloader" download "$package"
+        ) >&2
+
+        shopt -s nullglob
+        packages=("$work_dir"/packages/*.deb)
+        [ "${#packages[@]}" -eq 1 ] \
+            || ucsi_die "expected one downloaded $package package, found ${#packages[@]}"
+        dpkg-deb -x "${packages[0]}" "$work_dir/extracted"
+        extracted_kernel="$(ucsi_find_extracted_kernel "$work_dir/extracted" "$release")" \
+            || ucsi_die "$package did not contain a readable, nonempty vmlinuz-$release"
+
+        publish_tmp="${cache_file}.tmp.$$.$RANDOM"
+        cp -- "$extracted_kernel" "$publish_tmp"
+        chmod u+rw -- "$publish_tmp"
+        [ -s "$publish_tmp" ] && [ -r "$publish_tmp" ] \
+            || ucsi_die "extracted kernel failed cache validation"
+        mv -f -- "$publish_tmp" "$cache_file"
+        publish_tmp=""
+    )
+
+    ucsi_select_supermin_kernel "" "$cache_file" \
+        || ucsi_die "cached kernel is not readable and nonempty: $cache_file"
+}
+
+ucsi_preflight_guestfish() {
+    local cache_dir="$1" temp_root image log
+    temp_root="$cache_dir/libguestfs/tmp"
+    mkdir -p -- "$temp_root"
+    temp_root="$(realpath -e -- "$temp_root")" \
+        || ucsi_die "could not resolve libguestfs temporary directory"
+    image="$temp_root/preflight-$$-$RANDOM.img"
+    log="$temp_root/preflight-$$-$RANDOM.log"
+
+    if ! (
+        trap 'rm -f -- "$image" "$log"' EXIT
+        trap 'exit 129' HUP
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        if ! guestfish -N "$image=disk:1M" list-devices > /dev/null 2>"$log"; then
+            cat "$log" >&2
+            exit 1
+        fi
+    ); then
+        ucsi_die "guestfish could not launch its rootless appliance"
+    fi
+}
+
+ucsi_prepare_guestfish() {
+    local cache_dir="$1" release modules system_kernel cache_file kernel
+    command -v guestfish >/dev/null 2>&1 \
+        || ucsi_die "guestfish is required for result extraction"
+    command -v supermin >/dev/null 2>&1 \
+        || ucsi_die "supermin is required for the rootless guestfish appliance"
+
+    release="$(uname -r)"
+    ucsi_validate_kernel_release "$release" \
+        || ucsi_die "unsupported running kernel release: $release"
+    modules="/lib/modules/$release"
+    [ -d "$modules" ] && [ -r "$modules" ] \
+        || ucsi_die "matching kernel modules are not readable: $modules"
+
+    mkdir -p -- "$cache_dir"
+    cache_file="$(ucsi_kernel_cache_path "$cache_dir" "$release")"
+    system_kernel="/boot/vmlinuz-$release"
+    kernel="$(ucsi_select_supermin_kernel "$system_kernel" "$cache_file" || true)"
+    if [ -z "$kernel" ]; then
+        kernel="$(ucsi_cache_running_kernel "$cache_dir" "$release" "$cache_file")"
     fi
 
-    command -v sudo >/dev/null 2>&1 \
-        || ucsi_die "result extraction requires passwordless sudo: install sudo and allow 'sudo -n guestfish'"
-    if ! sudo -n guestfish --version >/dev/null 2>&1; then
-        ucsi_die "result extraction requires passwordless 'sudo -n guestfish'; configure it before starting the run"
-    fi
-    UCSI_GUESTFISH_CMD=(sudo -n guestfish)
+    SUPERMIN_KERNEL="$kernel"
+    SUPERMIN_MODULES="$modules"
+    export SUPERMIN_KERNEL
+    export SUPERMIN_MODULES
+    ucsi_log "guestfish kernel: $SUPERMIN_KERNEL"
+    ucsi_preflight_guestfish "$cache_dir"
 }
 
 # ucsi_port_free PORT -> 0 if nothing is listening inside the devcontainer.
@@ -748,7 +910,7 @@ ucsi_type_smoke_command() {
 ucsi_extract_guest_result() {
     local overlay="$1" out_file="$2"
     # NTFS is the last partition; guestfish's inspection finds the Windows root.
-    "${UCSI_GUESTFISH_CMD[@]}" --ro -a "$overlay" -i \
+    guestfish --ro -a "$overlay" -i \
         download "$UCSI_GUEST_RESULT_PATH" "$out_file" 2>/dev/null
 }
 
@@ -830,6 +992,7 @@ build 26100 lacks ACPI FF-A support and cannot pass, even with a custom --image.
     fi
 
     ucsi_require_tools
+    ucsi_prepare_guestfish "$cache_dir"
 
     local workflow_sha local_head
     workflow_sha="$(ucsi_resolve_workflow_sha "$workflow_repo" "$workflow_ref")"
@@ -851,7 +1014,6 @@ $local_head. Push the branch or select a --workflow-ref that resolves to local H
 
     ucsi_ensure_devcontainer
     ucsi_require_devcontainer_tools
-    ucsi_select_guestfish
 
     # ---- deterministic cache key ----
     local source_id workflow_hash cache_key dispatch_nonce

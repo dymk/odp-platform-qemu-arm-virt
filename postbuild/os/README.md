@@ -51,8 +51,18 @@ or import a pre-built image instead of dispatching the workflow:
 
 The cache directory must resolve inside this repository so it is available at
 the matching `/workspaces/<repo>` path in the devcontainer. Rebuild the
-devcontainer after dependency changes. Non-root hosts must allow passwordless
-`sudo -n guestfish` so result extraction cannot prompt after a long run.
+devcontainer after dependency changes.
+
+Result extraction is rootless. The runner configures `guestfish`/`supermin`
+with the running kernel and matching `/lib/modules` tree. If the host kernel
+under `/boot` is unreadable, Debian/Ubuntu hosts automatically download the
+matching `linux-image-$(uname -r)` package without elevated privileges,
+extract its kernel with `dpkg-deb`, and atomically publish it in a
+release-keyed cache below the runner cache directory. Later runs reuse that
+kernel without another package download. This requires `guestfish` and
+`supermin`; the fallback also requires `apt` (or `apt-get`) and `dpkg-deb`.
+The runner preflights the real libguestfs appliance before starting the
+long-running firmware and guest workflow.
 
 Run `scripts/run-ucsi-windows-e2e.sh --help` for the full option list. Unit
 tests for the runner's pure logic live in
