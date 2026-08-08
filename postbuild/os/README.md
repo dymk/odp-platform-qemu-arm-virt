@@ -22,3 +22,29 @@ If you want you can force regeneration of the winvos.qcow2 image using
 GDB server is at:  `127.0.0.1:5555`. 
 
 Windbg can be connected on  `windbg -k com:ipport=56789,port=127.0.0.1 -v`
+
+## Windows UCSI ACPI -> FF-A end-to-end runner
+
+`scripts/run-ucsi-windows-e2e.sh` drives the full Windows UCSI path
+(`ucsi-smoke.exe -> ectest.sys -> ECT0.USND -> FFixedHw/FFAC -> Windows FF-A
+-> secure UCSI SP`). It builds/reuses the firmware, dispatches the
+`build_os_image` workflow (which injects the `ectest` driver and the smoke app),
+caches the resulting image by a deterministic key, boots a disposable qcow2
+overlay, and asserts both the guest success line and the secure UCSI UUID in the
+boot log.
+
+The public ValidationOS (build `26100.x`) lacks ACPI FF-A support, so the runner
+refuses any build `< 28000`. Declare the build explicitly:
+
+    scripts/run-ucsi-windows-e2e.sh \
+      --validation-os-url <ARM64-ValidationOS-ISO-URL> \
+      --validation-os-build 28000
+
+or import a pre-built image instead of dispatching the workflow:
+
+    scripts/run-ucsi-windows-e2e.sh --image path/to/os-image.vhdx \
+      --validation-os-build 28000
+
+Run `scripts/run-ucsi-windows-e2e.sh --help` for the full option list. Unit
+tests for the runner's pure logic live in
+`scripts/tests/run-ucsi-windows-e2e-test.sh`.

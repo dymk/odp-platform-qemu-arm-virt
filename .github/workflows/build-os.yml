@@ -25,10 +25,25 @@ on:
       - '.github/workflows/build-os.yml'
   workflow_dispatch:
     inputs:
+      validation_os_url:
+        description: 'URL of the ARM64 ValidationOS ISO to download'
+        required: false
+        default: 'https://aka.ms/DownloadValidationOS_arm64'
+        type: string
       drivers_repo:
         description: 'GitHub repository to download driver assets from (owner/repo)'
         required: false
         default: 'OpenDevicePartnership/odp-windows-drivers'
+        type: string
+      smoke_repo:
+        description: 'Repository hosting the ec-test-apps-ARM64.zip smoke app (owner/repo)'
+        required: false
+        default: 'dymk/odp-platform-common'
+        type: string
+      smoke_release:
+        description: 'Release tag on smoke_repo to pull the smoke app from'
+        required: false
+        default: 'latest'
         type: string
   workflow_call:
     inputs:
@@ -36,10 +51,25 @@ on:
         description: 'Git tag in vYYYY.MM.DD format'
         required: true
         type: string
+      validation_os_url:
+        description: 'URL of the ARM64 ValidationOS ISO to download'
+        required: false
+        default: 'https://aka.ms/DownloadValidationOS_arm64'
+        type: string
       drivers_repo:
         description: 'GitHub repository to download driver assets from (owner/repo)'
         required: false
         default: 'OpenDevicePartnership/odp-windows-drivers'
+        type: string
+      smoke_repo:
+        description: 'Repository hosting the ec-test-apps-ARM64.zip smoke app (owner/repo)'
+        required: false
+        default: 'dymk/odp-platform-common'
+        type: string
+      smoke_release:
+        description: 'Release tag on smoke_repo to pull the smoke app from'
+        required: false
+        default: 'latest'
         type: string
 
 concurrency:
@@ -108,7 +138,26 @@ jobs:
       - name: Download Validation OS ISO
         run: |
           $ProgressPreference = 'SilentlyContinue'
-          Invoke-WebRequest 'https://aka.ms/DownloadValidationOS_arm64' -OutFile 'ValidationOS.iso'
+          $isoUrl = '${{ inputs.validation_os_url || 'https://aka.ms/DownloadValidationOS_arm64' }}'
+          Write-Host "Downloading Validation OS ISO from $isoUrl"
+          Invoke-WebRequest $isoUrl -OutFile 'ValidationOS.iso'
+
+      - name: Download UCSI smoke app
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $smokeRepo = '${{ inputs.smoke_repo || 'dymk/odp-platform-common' }}'
+          $smokeRelease = '${{ inputs.smoke_release || 'latest' }}'
+          $zip = Join-Path $env:RUNNER_TEMP 'ec-test-apps-ARM64.zip'
+          $dest = Join-Path $env:RUNNER_TEMP 'ucsi-smoke-app'
+          Write-Host "Downloading ec-test-apps-ARM64.zip from ${smokeRepo}@${smokeRelease}"
+          gh release download $smokeRelease --repo $smokeRepo --pattern 'ec-test-apps-ARM64.zip' --dir $env:RUNNER_TEMP --clobber
+          if ($LASTEXITCODE -ne 0) { throw "Failed to download UCSI smoke app from ${smokeRepo}@${smokeRelease}" }
+          if (Test-Path $dest) { Remove-Item -Path $dest -Recurse -Force }
+          Expand-Archive -Path $zip -DestinationPath $dest -Force
+          $app = Get-ChildItem -Path $dest -Recurse -Filter 'ec-test-tui.exe' -File | Select-Object -First 1
+          if (-not $app) { throw 'UCSI smoke executable ec-test-tui.exe not found in app archive' }
+          "UCSI_SMOKE_APP=$($app.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Build WIM
         run: |
@@ -215,7 +264,7 @@ jobs:
 
             foreach ($infPath in $infPaths) {
               Write-Host "Injecting driver $($infPath.FullName)"
-              dism.exe /Image:$mountPath /Add-Driver /Driver:$($infPath.FullName)
+              dism.exe /Image:$mountPath /Add-Driver /Driver:$($infPath.FullName) /ForceUnsigned
               if ($LASTEXITCODE -ne 0) { throw "Failed to add driver $($infPath.FullName) with exit code $LASTEXITCODE" }
             }
 
@@ -271,6 +320,14 @@ jobs:
             New-Item -Path $acpiTargetDir -ItemType Directory -Force | Out-Null
             Copy-Item -Path $env:ACPITABL_DAT_PATH -Destination (Join-Path $acpiTargetDir 'ACPITABL.dat') -Force
             Write-Host "Copied ACPITABL.dat to ${acpiTargetDir}"
+
+            if (-not $env:UCSI_SMOKE_APP -or -not (Test-Path $env:UCSI_SMOKE_APP)) {
+              throw 'UCSI_SMOKE_APP is missing'
+            }
+            $smokeDir = "${osLetter}:\ucsi-smoke"
+            New-Item -Path $smokeDir -ItemType Directory -Force | Out-Null
+            Copy-Item -Path $env:UCSI_SMOKE_APP -Destination (Join-Path $smokeDir 'ucsi-smoke.exe') -Force
+            Write-Host "Copied UCSI smoke executable to ${smokeDir}"
 
             Write-Host "Creating boot files on ${efiLetter}:\"
             bcdboot "${osLetter}:\Windows" /s "${efiLetter}:" /f UEFI
