@@ -146,7 +146,8 @@ ENV PATH="/usr/local/lib/sccache:$PATH"
 # Install stuart tools for building UEFI
 USER vscode
 COPY mod/uefi/patina-qemu/pip-requirements.txt /tmp/pip-requirements.txt
-RUN pip install --upgrade -r /tmp/pip-requirements.txt pip lcov_cobertura
+RUN pip install --upgrade -r /tmp/pip-requirements.txt pip lcov_cobertura \
+    vncdotool==1.3.0 Pillow==12.3.0
 USER root
 
 COPY --from=qemu-builder /usr/local/bin/qemu-system-aarch64 /usr/local/bin/qemu-system-aarch64

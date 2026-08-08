@@ -60,11 +60,13 @@ ucsi_validate_os_build() {
 }
 
 # ucsi_compute_cache_key SOURCE_ID OS_BUILD DRIVERS_REPO SMOKE_REPO \
-#                        SMOKE_RELEASE WORKFLOW_REPO WORKFLOW_REF WORKFLOW_HASH
+#                        SMOKE_RELEASE WORKFLOW_REPO WORKFLOW_REF WORKFLOW_SHA \
+#                        WORKFLOW_HASH
 # Deterministic hex digest over every input that must invalidate a cached
 # image. Each argument occupies its own line so field order and boundaries are
 # unambiguous; any change to any field changes the digest.
 ucsi_compute_cache_key() {
+    [ "$#" -eq 9 ] || return 2
     printf '%s\n' "$@" | sha256sum | awk '{print $1}'
 }
 
@@ -103,6 +105,84 @@ ucsi_parse_run_id() {
     id="$(printf '%s' "$text" | grep -oE 'actions/runs/[0-9]+' | head -n1 | grep -oE '[0-9]+$' || true)"
     [ -n "$id" ] || return 1
     printf '%s\n' "$id"
+}
+
+ucsi_dispatch_run_title() {
+    printf 'build_os_image [%s]\n' "$1"
+}
+
+ucsi_select_nonce_run_id() {
+    local json="${1-}" nonce="${2-}" expected_sha="${3-}"
+    [ -n "$json" ] && [ -n "$nonce" ] && [ -n "$expected_sha" ] || return 1
+    python3 -c '
+import json
+import sys
+
+expected = "build_os_image [%s]" % sys.argv[1]
+expected_sha = sys.argv[2]
+try:
+    runs = json.load(sys.stdin)
+except (json.JSONDecodeError, TypeError):
+    sys.exit(1)
+
+if isinstance(runs, dict):
+    runs = [runs]
+for run in runs:
+    if (
+        run.get("event") == "workflow_dispatch"
+        and run.get("displayTitle") == expected
+        and run.get("headSha") == expected_sha
+    ):
+        run_id = run.get("databaseId")
+        if isinstance(run_id, int):
+            print(run_id)
+            sys.exit(0)
+sys.exit(1)
+' "$nonce" "$expected_sha" <<< "$json"
+}
+
+ucsi_validate_repo_name() {
+    local value="${1-}"
+    [[ "$value" =~ ^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
+}
+
+ucsi_validate_safe_token() {
+    local value="${1-}"
+    [[ "$value" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]
+}
+
+ucsi_compose_firmware_stamp() {
+    [ "$#" -eq 3 ] || return 2
+    printf 'armvirt=%s secure-services=%s patina-qemu=%s\n' "$1" "$2" "$3"
+}
+
+ucsi_can_reuse_firmware() {
+    local force="$1" dirty="$2" artifacts_ready="$3" stamp_matches="$4"
+    [ "$force" = "0" ] && [ "$dirty" = "0" ] \
+        && [ "$artifacts_ready" = "1" ] && [ "$stamp_matches" = "1" ]
+}
+
+ucsi_path_within_repo() {
+    local path root
+    path="$(realpath -m -- "$1")" || return 1
+    root="$(realpath -m -- "$2")" || return 1
+    case "$path" in
+        "$root"|"$root"/*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+ucsi_should_delete_overlay() {
+    local verified_success="$1" keep_requested="$2"
+    [ "$verified_success" = "1" ] && [ "$keep_requested" = "0" ]
+}
+
+ucsi_guestfish_command_for_euid() {
+    if [ "$1" = "0" ]; then
+        printf 'guestfish\n'
+    else
+        printf 'sudo -n guestfish\n'
+    fi
 }
 
 # ucsi_relative_backing_path OVERLAY_PATH BASE_PATH
@@ -148,6 +228,7 @@ Options:
   --help                        Show this help.
 
 Requires: gh (authenticated), git, qemu-img, guestfish, devcontainer, timeout.
+Non-root users also require passwordless `sudo -n guestfish`.
 Runs no dry-run/fake-success mode; a real >= 28000 image is required to pass.
 EOF
 }
@@ -173,17 +254,14 @@ ucsi_host_to_container_path() {
 # an unchanged image reuses its cache. For a URL, the URL string is identity.
 ucsi_image_identity() {
     local path="$1"
-    local sz mt
-    sz="$(stat -c %s "$path" 2>/dev/null || echo 0)"
-    mt="$(stat -c %Y "$path" 2>/dev/null || echo 0)"
-    printf 'image:%s:%s:%s\n' "$(basename "$path")" "$sz" "$mt"
+    printf 'image:%s\n' "$(sha256sum "$path" | awk '{print $1}')"
 }
 
 # ---- tooling / ports ----
 ucsi_require_tools() {
     local missing=()
     local t
-    for t in gh git qemu-img guestfish devcontainer timeout sha256sum realpath; do
+    for t in gh git qemu-img devcontainer timeout sha256sum realpath python3 tail; do
         command -v "$t" >/dev/null 2>&1 || missing+=("$t")
     done
     if [ "${#missing[@]}" -gt 0 ]; then
@@ -192,6 +270,35 @@ ucsi_require_tools() {
     if ! gh auth status >/dev/null 2>&1; then
         ucsi_die "GitHub CLI is not authenticated. Run 'gh auth login' and retry."
     fi
+}
+
+ucsi_require_devcontainer_tools() {
+    if ! ucsi_dc sh -c 'command -v vncdo >/dev/null 2>&1'; then
+        ucsi_die "vncdo is missing inside the devcontainer; rebuild it after installing vncdotool==1.3.0"
+    fi
+    if ! ucsi_dc python3 -c 'from PIL import Image' >/dev/null 2>&1; then
+        ucsi_die "Pillow is missing inside the devcontainer; rebuild it after installing Pillow==12.3.0"
+    fi
+}
+
+ucsi_select_guestfish() {
+    local command
+    command="$(ucsi_guestfish_command_for_euid "$EUID")"
+    if [ "$command" = "guestfish" ]; then
+        command -v guestfish >/dev/null 2>&1 \
+            || ucsi_die "guestfish is required for result extraction"
+        guestfish --version >/dev/null 2>&1 \
+            || ucsi_die "guestfish is installed but unusable"
+        UCSI_GUESTFISH_CMD=(guestfish)
+        return
+    fi
+
+    command -v sudo >/dev/null 2>&1 \
+        || ucsi_die "result extraction requires passwordless sudo: install sudo and allow 'sudo -n guestfish'"
+    if ! sudo -n guestfish --version >/dev/null 2>&1; then
+        ucsi_die "result extraction requires passwordless 'sudo -n guestfish'; configure it before starting the run"
+    fi
+    UCSI_GUESTFISH_CMD=(sudo -n guestfish)
 }
 
 # ucsi_port_free PORT -> 0 if nothing is listening on 127.0.0.1:PORT
@@ -213,11 +320,40 @@ Refusing to launch; stop it yourself (this runner never kills unrelated processe
 
 # ---- firmware build with a SHA-keyed stamp ----
 ucsi_firmware_stamp_value() {
-    local repo_root="$1" armvirt_head ss_sha
+    local repo_root="$1" armvirt_head ss_sha patina_sha
     armvirt_head="$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || echo unknown)"
-    ss_sha="$(git -C "$repo_root" submodule status -- mod/secure-services/odp-secure-services 2>/dev/null \
-        | awk '{gsub(/^[-+ ]/,"",$1); print $1}')"
-    printf 'armvirt=%s secure-services=%s\n' "$armvirt_head" "${ss_sha:-unknown}"
+    ss_sha="$(git -C "$repo_root/mod/secure-services/odp-secure-services" rev-parse HEAD 2>/dev/null \
+        || echo unknown)"
+    patina_sha="$(git -C "$repo_root/mod/uefi/patina-qemu" rev-parse HEAD 2>/dev/null \
+        || echo unknown)"
+    ucsi_compose_firmware_stamp "$armvirt_head" "$ss_sha" "$patina_sha"
+}
+
+ucsi_firmware_inputs_dirty() {
+    local repo_root="$1" status
+    if ! status="$(git -C "$repo_root" status --porcelain --untracked-files=all -- \
+        .gitmodules \
+        mod/secure-services/odp-secure-services \
+        mod/secure-services/platform \
+        mod/uefi/patina-qemu \
+        mod/uefi/platform)"; then
+        return 0
+    fi
+    if [ -n "$status" ]; then
+        return 0
+    fi
+    if ! status="$(git -C "$repo_root/mod/secure-services/odp-secure-services" \
+        status --porcelain --untracked-files=all)"; then
+        return 0
+    fi
+    if [ -n "$status" ]; then
+        return 0
+    fi
+    if ! status="$(git -C "$repo_root/mod/uefi/patina-qemu" \
+        status --porcelain --untracked-files=all)"; then
+        return 0
+    fi
+    [ -n "$status" ]
 }
 
 ucsi_ensure_firmware() {
@@ -225,10 +361,17 @@ ucsi_ensure_firmware() {
     local fv_dir="$repo_root/mod/uefi/patina-qemu/Build/QemuArmVirtPkg/DEBUG_CLANGPDB/FV"
     local flash0="$fv_dir/SECURE_FLASH0.fd" efi="$fv_dir/QEMU_EFI.fd"
     local stamp="$repo_root/postbuild/os/build/ucsi-windows-e2e-cache/firmware.stamp"
-    local want; want="$(ucsi_firmware_stamp_value "$repo_root")"
+    local want dirty=0 artifacts_ready=0 stamp_matches=0
+    want="$(ucsi_firmware_stamp_value "$repo_root")"
+    ucsi_firmware_inputs_dirty "$repo_root" && dirty=1
+    if [ -f "$flash0" ] && [ -f "$efi" ]; then
+        artifacts_ready=1
+    fi
+    if [ -f "$stamp" ] && [ "$(cat "$stamp")" = "$want" ]; then
+        stamp_matches=1
+    fi
 
-    if [ "$force" != "1" ] && [ -f "$flash0" ] && [ -f "$efi" ] && [ -f "$stamp" ] \
-        && [ "$(cat "$stamp")" = "$want" ]; then
+    if ucsi_can_reuse_firmware "$force" "$dirty" "$artifacts_ready" "$stamp_matches"; then
         ucsi_log "firmware cache hit ($want)"
         return 0
     fi
@@ -237,35 +380,58 @@ ucsi_ensure_firmware() {
     make -C "$repo_root/mod" uefi
     [ -f "$flash0" ] || ucsi_die "firmware build did not produce $flash0"
     [ -f "$efi" ] || ucsi_die "firmware build did not produce $efi"
-    mkdir -p "$(dirname "$stamp")"
-    printf '%s\n' "$want" > "$stamp"
-    ucsi_log "firmware built and stamped ($want)"
+    if ucsi_firmware_inputs_dirty "$repo_root"; then
+        ucsi_log "firmware inputs are dirty; cache stamp not written"
+    else
+        want="$(ucsi_firmware_stamp_value "$repo_root")"
+        mkdir -p "$(dirname "$stamp")"
+        printf '%s\n' "$want" > "$stamp"
+        ucsi_log "firmware built and stamped ($want)"
+    fi
 }
 
 # ---- workflow dispatch + artifact download ----
+ucsi_resolve_workflow_sha() {
+    local repo="$1" ref="$2" sha
+    sha="$(gh api "repos/$repo/commits/$ref" --jq .sha 2>/dev/null || true)"
+    [[ "$sha" =~ ^[0-9a-fA-F]{40}$ ]] || sha=""
+    [ -n "$sha" ] || ucsi_die "could not resolve immutable commit for $repo@$ref"
+    printf '%s\n' "$sha"
+}
+
 # Dispatches build_os_image and prints the resolved numeric run ID.
 ucsi_dispatch_workflow() {
-    local repo="$1" ref="$2" vos_url="$3" drivers_repo="$4" smoke_repo="$5" smoke_release="$6"
-    local out run_id
+    local repo="$1" ref="$2" vos_url="$3" drivers_repo="$4" smoke_repo="$5"
+    local smoke_release="$6" nonce="$7" expected_sha="$8"
+    local out run_id="" matched_id
     ucsi_log "dispatching $UCSI_WORKFLOW_ID on $repo@$ref"
     out="$(gh workflow run "$UCSI_WORKFLOW_ID" --repo "$repo" --ref "$ref" \
         -f "validation_os_url=$vos_url" \
         -f "drivers_repo=$drivers_repo" \
         -f "smoke_repo=$smoke_repo" \
-        -f "smoke_release=$smoke_release" 2>&1)" || ucsi_die "gh workflow run failed: $out"
+        -f "smoke_release=$smoke_release" \
+        -f "dispatch_nonce=$nonce" 2>&1)" || ucsi_die "gh workflow run failed: $out"
 
-    if run_id="$(ucsi_parse_run_id "$out")"; then
-        printf '%s\n' "$run_id"
-        return 0
-    fi
+    run_id="$(ucsi_parse_run_id "$out" || true)"
 
-    # gh workflow run does not always echo the run URL; fall back to the newest
-    # run for this workflow on this ref.
-    sleep 5
-    run_id="$(gh run list --repo "$repo" --workflow "$UCSI_WORKFLOW_ID" \
-        --branch "$ref" --limit 1 --json databaseId --jq '.[0].databaseId' 2>/dev/null || true)"
-    [ -n "$run_id" ] || ucsi_die "could not resolve dispatched run ID"
-    printf '%s\n' "$run_id"
+    local attempt runs_json
+    for attempt in {1..10}; do
+        if [ -n "$run_id" ]; then
+            runs_json="$(gh run view "$run_id" --repo "$repo" \
+                --json databaseId,event,displayTitle,headSha 2>/dev/null || true)"
+        else
+            runs_json="$(gh run list --repo "$repo" --workflow "$UCSI_WORKFLOW_ID" \
+                --limit 50 --json databaseId,event,displayTitle,headSha 2>/dev/null || true)"
+        fi
+        if matched_id="$(ucsi_select_nonce_run_id "$runs_json" "$nonce" "$expected_sha")"; then
+            printf '%s\n' "$matched_id"
+            return 0
+        fi
+        if [ "$attempt" -lt 10 ]; then
+            read -r -t 2 _ < <(timeout 3 tail -f /dev/null) || true
+        fi
+    done
+    ucsi_die "could not resolve workflow_dispatch run with title '$(ucsi_dispatch_run_title "$nonce")'"
 }
 
 ucsi_download_artifact_vhdx() {
@@ -286,7 +452,8 @@ ucsi_download_artifact_vhdx() {
 ucsi_resolve_base_image() {
     local cache_dir="$1" key="$2" force="$3" image_path="$4"
     local vos_url="$5" workflow_repo="$6" workflow_ref="$7"
-    local drivers_repo="$8" smoke_repo="$9" smoke_release="${10}"
+    local drivers_repo="$8" smoke_repo="$9" smoke_release="${10}" nonce="${11}"
+    local workflow_sha="${12}"
     local base_qcow2="$cache_dir/$key.qcow2"
     mkdir -p "$cache_dir"
 
@@ -317,7 +484,7 @@ ucsi_resolve_base_image() {
 
     local run_id vhdx
     run_id="$(ucsi_dispatch_workflow "$workflow_repo" "$workflow_ref" "$vos_url" \
-        "$drivers_repo" "$smoke_repo" "$smoke_release")"
+        "$drivers_repo" "$smoke_repo" "$smoke_release" "$nonce" "$workflow_sha")"
     vhdx="$(ucsi_download_artifact_vhdx "$workflow_repo" "$run_id" "$cache_dir/artifact-$run_id")"
     ucsi_log "converting downloaded VHDX to base qcow2"
     qemu-img convert -f vhdx -O qcow2 "$vhdx" "$base_qcow2"
@@ -401,7 +568,8 @@ ucsi_type_smoke_command() {
 ucsi_extract_guest_result() {
     local overlay="$1" out_file="$2"
     # NTFS is the last partition; guestfish's inspection finds the Windows root.
-    guestfish --ro -a "$overlay" -i download "$UCSI_GUEST_RESULT_PATH" "$out_file" 2>/dev/null
+    "${UCSI_GUESTFISH_CMD[@]}" --ro -a "$overlay" -i \
+        download "$UCSI_GUEST_RESULT_PATH" "$out_file" 2>/dev/null
 }
 
 # ---------------------------------------------------------------------------
@@ -434,7 +602,7 @@ ucsi_main() {
         esac
     done
 
-    UCSI_REPO_ROOT="$(ucsi_repo_root)"
+    UCSI_REPO_ROOT="$(realpath -e -- "$(ucsi_repo_root)")"
 
     # ---- source declaration & build gate ----
     if [ -n "$validation_os_url" ] && [ -n "$image_path" ]; then
@@ -470,19 +638,42 @@ build 26100 lacks ACPI FF-A support and cannot pass, even with a custom --image.
         [ -n "$workflow_repo" ] || workflow_repo="dymk/odp-platform-qemu-arm-virt"
     fi
 
+    ucsi_validate_repo_name "$drivers_repo" \
+        || ucsi_die "--drivers-repo must be OWNER/REPO using only letters, digits, '.', '_', or '-'"
+    ucsi_validate_repo_name "$smoke_repo" \
+        || ucsi_die "--smoke-repo must be OWNER/REPO using only letters, digits, '.', '_', or '-'"
+    ucsi_validate_repo_name "$workflow_repo" \
+        || ucsi_die "--workflow-repo must be OWNER/REPO using only letters, digits, '.', '_', or '-'"
+    ucsi_validate_safe_token "$smoke_release" \
+        || ucsi_die "--smoke-release contains unsupported characters"
+
+    cache_dir="$(realpath -m -- "$cache_dir")"
+    if ! ucsi_path_within_repo "$cache_dir" "$UCSI_REPO_ROOT"; then
+        ucsi_die "--cache-dir must resolve inside the repository root ($UCSI_REPO_ROOT)"
+    fi
+
     ucsi_require_tools
+    ucsi_require_devcontainer_tools
+    ucsi_select_guestfish
 
     # ---- deterministic cache key ----
-    local source_id workflow_hash cache_key
+    local source_id workflow_hash workflow_sha cache_key dispatch_nonce
     if [ -n "$image_path" ]; then
         source_id="$(ucsi_image_identity "$image_path")"
     else
         source_id="url:$validation_os_url"
     fi
+    workflow_sha="$(ucsi_resolve_workflow_sha "$workflow_repo" "$workflow_ref")"
     workflow_hash="$(sha256sum "$UCSI_REPO_ROOT/$UCSI_WORKFLOW_FILE" | awk '{print $1}')"
     cache_key="$(ucsi_compute_cache_key "$source_id" "$os_build" "$drivers_repo" \
-        "$smoke_repo" "$smoke_release" "$workflow_repo" "$workflow_ref" "$workflow_hash")"
+        "$smoke_repo" "$smoke_release" "$workflow_repo" "$workflow_ref" \
+        "$workflow_sha" "$workflow_hash")"
     ucsi_log "cache key: $cache_key"
+    ucsi_log "workflow source: $workflow_repo@$workflow_sha"
+
+    dispatch_nonce="ucsi-$(date +%s%N)-$$-$RANDOM"
+    ucsi_validate_safe_token "$dispatch_nonce" \
+        || ucsi_die "internal error: generated dispatch nonce is invalid"
 
     # ---- firmware ----
     ucsi_ensure_firmware "$UCSI_REPO_ROOT" "$force_firmware"
@@ -491,7 +682,7 @@ build 26100 lacks ACPI FF-A support and cannot pass, even with a custom --image.
     local base_image
     base_image="$(ucsi_resolve_base_image "$cache_dir" "$cache_key" "$force_image" \
         "$image_path" "$validation_os_url" "$workflow_repo" "$workflow_ref" \
-        "$drivers_repo" "$smoke_repo" "$smoke_release")"
+        "$drivers_repo" "$smoke_repo" "$smoke_release" "$dispatch_nonce" "$workflow_sha")"
     ucsi_log "base image: $base_image"
 
     # ---- disposable overlay with a relative backing path ----
@@ -512,13 +703,14 @@ build 26100 lacks ACPI FF-A support and cannot pass, even with a custom --image.
 
     # ---- boot QEMU (background, bounded by --boot-timeout) ----
     UCSI_RUNNER_PID=""
+    UCSI_VERIFIED_SUCCESS=0
     ucsi_cleanup() {
         local code=$?
         if [ -n "${UCSI_RUNNER_PID:-}" ] && kill -0 "$UCSI_RUNNER_PID" 2>/dev/null; then
             kill "$UCSI_RUNNER_PID" 2>/dev/null || true
             wait "$UCSI_RUNNER_PID" 2>/dev/null || true
         fi
-        if [ "$keep_run_image" != "1" ] && [ "${UCSI_KEEP_OVERLAY:-0}" != "1" ]; then
+        if ucsi_should_delete_overlay "$UCSI_VERIFIED_SUCCESS" "$keep_run_image"; then
             rm -f "$overlay"
         fi
         exit "$code"
@@ -540,12 +732,14 @@ build 26100 lacks ACPI FF-A support and cannot pass, even with a custom --image.
     # ---- drive the guest over VNC ----
     local deadline=$(( $(date +%s) + boot_timeout ))
     if ! ucsi_wait_for_prompt "$run_dir" "$deadline"; then
-        UCSI_KEEP_OVERLAY=1
         ucsi_report_failure "$run_dir" "$boot_log" "$overlay" "timed out waiting for the ValidationOS prompt"
     fi
 
     ucsi_log "typing smoke command"
-    ucsi_type_smoke_command
+    if ! ucsi_type_smoke_command; then
+        ucsi_report_failure "$run_dir" "$boot_log" "$overlay" \
+            "failed to type or submit the UCSI smoke command over VNC"
+    fi
 
     # The smoke app writes the result then shuts down; wait for QEMU to exit.
     # The stuart wrapper may exit non-zero (known UTF-8 serial decoder bug), so
@@ -554,7 +748,6 @@ build 26100 lacks ACPI FF-A support and cannot pass, even with a custom --image.
     UCSI_RUNNER_PID=""
 
     # ---- verdict: guest result line AND secure-world UUID in the boot log ----
-    UCSI_KEEP_OVERLAY=1
     if ! ucsi_extract_guest_result "$overlay" "$result_file"; then
         ucsi_report_failure "$run_dir" "$boot_log" "$overlay" "could not read $UCSI_GUEST_RESULT_PATH from the guest"
     fi
@@ -566,7 +759,7 @@ build 26100 lacks ACPI FF-A support and cannot pass, even with a custom --image.
         ucsi_report_failure "$run_dir" "$boot_log" "$overlay" \
             "boot log missing secure UCSI UUID $UCSI_SECURE_UUID (secure world not reached)"
     fi
-    UCSI_KEEP_OVERLAY=0
+    UCSI_VERIFIED_SUCCESS=1
 
     ucsi_log "SUCCESS: Windows UCSI ACPI/FF-A E2E passed"
     ucsi_log "  result:   $result_file"

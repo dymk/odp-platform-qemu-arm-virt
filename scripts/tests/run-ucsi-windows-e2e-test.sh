@@ -3,11 +3,8 @@
 #
 # SPDX-License-Identifier: MIT
 #
-# These exercise the library-only surface of the runner (sourced with
-# UCSI_WINDOWS_E2E_SOURCE_ONLY=1) with no external processes, network, or
-# QEMU. They cover build-gate validation, the deterministic image cache key,
-# cached-image selection precedence, guest-result parsing, workflow run-ID
-# extraction, and relative overlay backing-path computation.
+# These exercise the library-only surface of the runner and static workflow
+# contracts without network access or QEMU.
 #
 # No test framework: a couple of tiny assert helpers and a pass/fail counter.
 
@@ -15,6 +12,9 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROD="$(cd "$SCRIPT_DIR/.." && pwd)/run-ucsi-windows-e2e.sh"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+WORKFLOW="$REPO_ROOT/.github/workflows/build-os.yml"
+DOCKERFILE="$REPO_ROOT/.devcontainer/Dockerfile"
 
 TESTS_RUN=0
 TESTS_FAILED=0
@@ -84,6 +84,26 @@ expect_ne() {
     fi
 }
 
+expect_contains() {
+    local desc="$1" file="$2" pattern="$3"
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if grep -Eq -- "$pattern" "$file"; then
+        ok "$desc"
+    else
+        fail "$desc (pattern '$pattern' not found in $file)"
+    fi
+}
+
+expect_not_contains() {
+    local desc="$1" file="$2" pattern="$3"
+    TESTS_RUN=$((TESTS_RUN + 1))
+    if grep -Eq -- "$pattern" "$file"; then
+        fail "$desc (unexpected pattern '$pattern' found in $file)"
+    else
+        ok "$desc"
+    fi
+}
+
 # ----- source the implementation (library-only) -----
 if [ -f "$PROD" ]; then
     # shellcheck source=/dev/null
@@ -112,22 +132,40 @@ echo "== cache-key =="
 assert_have_fn ucsi_compute_cache_key
 # Canonical positional order:
 #   SOURCE_ID OS_BUILD DRIVERS_REPO SMOKE_REPO SMOKE_RELEASE \
-#   WORKFLOW_REPO WORKFLOW_REF WORKFLOW_HASH
-base_args=(https://example/vos.iso 28000 org/drv dymk/common latest dymk/qemu main deadbeef)
+#   WORKFLOW_REPO WORKFLOW_REF WORKFLOW_SHA WORKFLOW_HASH
+base_args=(https://example/vos.iso 28000 org/drv dymk/common latest dymk/qemu main \
+    1111111111111111111111111111111111111111 deadbeef)
 BASE_KEY="$(ucsi_compute_cache_key "${base_args[@]}")"
 expect_ne "key is non-empty" "$BASE_KEY" ""
 SAME_KEY="$(ucsi_compute_cache_key "${base_args[@]}")"
 expect_eq "identical inputs -> identical key" "$BASE_KEY" "$SAME_KEY"
+expect_fail "cache key rejects missing workflow SHA" ucsi_compute_cache_key \
+    "${base_args[@]:0:7}" "${base_args[8]}"
 
 # Flip each input in turn; the key must change every time.
-declare -a labels=(source os_build drivers_repo smoke_repo smoke_release workflow_repo workflow_ref workflow_hash)
-declare -a mutated=(https://example/OTHER.iso 28001 org/OTHERdrv dymk/OTHER other-tag dymk/OTHERqemu other-ref cafef00d)
+declare -a labels=(source os_build drivers_repo smoke_repo smoke_release workflow_repo workflow_ref workflow_sha workflow_hash)
+declare -a mutated=(https://example/OTHER.iso 28001 org/OTHERdrv dymk/OTHER other-tag dymk/OTHERqemu other-ref \
+    2222222222222222222222222222222222222222 cafef00d)
 for i in "${!labels[@]}"; do
     args=("${base_args[@]}")
     args[$i]="${mutated[$i]}"
     k="$(ucsi_compute_cache_key "${args[@]}")"
     expect_ne "key changes when ${labels[$i]} changes" "$BASE_KEY" "$k"
 done
+
+# --image identity must be the full file content digest, not metadata.
+assert_have_fn ucsi_image_identity
+IMAGE_TMP="$SCRIPT_DIR/.tmp-image-identity-$$"
+mkdir -p "$IMAGE_TMP/a" "$IMAGE_TMP/b"
+printf 'AAAA' > "$IMAGE_TMP/a/same.qcow2"
+printf 'BBBB' > "$IMAGE_TMP/b/same.qcow2"
+touch -t 202608081822.24 "$IMAGE_TMP/a/same.qcow2" "$IMAGE_TMP/b/same.qcow2"
+image_a="$(ucsi_image_identity "$IMAGE_TMP/a/same.qcow2")"
+image_b="$(ucsi_image_identity "$IMAGE_TMP/b/same.qcow2")"
+expect_ne "same image metadata with different content -> different identity" "$image_a" "$image_b"
+expect_eq "image identity is the full SHA-256" \
+    "image:$(sha256sum "$IMAGE_TMP/a/same.qcow2" | awk '{print $1}')" "$image_a"
+rm -rf "$IMAGE_TMP"
 
 # =====================================================================
 # (c) cached-image selection: prefer QCOW2 > VHDX, none when absent
@@ -185,7 +223,34 @@ expect_fail "no URL -> non-zero" ucsi_parse_run_id "some unrelated text with no 
 expect_fail "empty -> non-zero"  ucsi_parse_run_id ""
 
 # =====================================================================
-# (f) relative overlay backing path: never an absolute host-only path
+# (f) nonce matching: select only the exact workflow_dispatch title
+# =====================================================================
+echo "== dispatch-nonce =="
+assert_have_fn ucsi_dispatch_run_title
+assert_have_fn ucsi_select_nonce_run_id
+NONCE='ucsi-1723130000000000000-1234-7'
+WORKFLOW_SHA='1111111111111111111111111111111111111111'
+TITLE="$(ucsi_dispatch_run_title "$NONCE" 2>/dev/null || true)"
+expect_eq "dispatch title incorporates nonce" "build_os_image [$NONCE]" "$TITLE"
+RUNS_JSON="$(printf \
+    '[{"databaseId":11,"event":"workflow_dispatch","displayTitle":"other","headSha":"%s"},
+{"databaseId":22,"event":"push","displayTitle":"%s","headSha":"%s"},
+{"databaseId":33,"event":"workflow_dispatch","displayTitle":"%s","headSha":"%s"}]' \
+    "$WORKFLOW_SHA" "$TITLE" "$WORKFLOW_SHA" "$TITLE" "$WORKFLOW_SHA")"
+matched_id="$(ucsi_select_nonce_run_id "$RUNS_JSON" "$NONCE" "$WORKFLOW_SHA" 2>/dev/null || true)"
+expect_eq "selects exact nonce-titled workflow_dispatch run" "33" "$matched_id"
+expect_fail "rejects JSON with no matching nonce" ucsi_select_nonce_run_id \
+    "$(printf '[{"databaseId":44,"event":"workflow_dispatch","displayTitle":"build_os_image [other]","headSha":"%s"}]' "$WORKFLOW_SHA")" \
+    "$NONCE" "$WORKFLOW_SHA"
+expect_fail "rejects nonce title on non-dispatch event" ucsi_select_nonce_run_id \
+    "$(printf '[{"databaseId":55,"event":"push","displayTitle":"%s","headSha":"%s"}]' "$TITLE" "$WORKFLOW_SHA")" \
+    "$NONCE" "$WORKFLOW_SHA"
+expect_fail "rejects matching nonce from a different source SHA" ucsi_select_nonce_run_id \
+    "$(printf '[{"databaseId":66,"event":"workflow_dispatch","displayTitle":"%s","headSha":"2222222222222222222222222222222222222222"}]' "$TITLE")" \
+    "$NONCE" "$WORKFLOW_SHA"
+
+# =====================================================================
+# (g) relative overlay backing path: never an absolute host-only path
 # =====================================================================
 echo "== relative-backing-path =="
 assert_have_fn ucsi_relative_backing_path
@@ -214,6 +279,98 @@ expect_eq "relative path is the expected '../basekey.qcow2'" "../basekey.qcow2" 
 resolved="$(cd "$(dirname "$OVERLAY")" && realpath -m "$rel")"
 expect_eq "relative path resolves back to base" "$(realpath -m "$BASE")" "$resolved"
 rm -rf "$BP_CACHE"
+
+# =====================================================================
+# (h) input validation
+# =====================================================================
+echo "== input-validation =="
+assert_have_fn ucsi_validate_repo_name
+expect_pass "owner/repo accepted" ucsi_validate_repo_name OpenDevicePartnership/odp-windows-drivers
+expect_pass "repository punctuation accepted" ucsi_validate_repo_name dymk/repo.name_2
+expect_fail "repository without owner rejected" ucsi_validate_repo_name repo
+expect_fail "repository shell syntax rejected" ucsi_validate_repo_name 'owner/repo;Write-Host-pwned'
+expect_fail "repository expression syntax rejected" ucsi_validate_repo_name 'owner/${{bad}}'
+
+assert_have_fn ucsi_validate_safe_token
+expect_pass "release tag accepted" ucsi_validate_safe_token v2026.08.08
+expect_pass "dispatch nonce accepted" ucsi_validate_safe_token "$NONCE"
+expect_fail "empty token rejected" ucsi_validate_safe_token ""
+expect_fail "token whitespace rejected" ucsi_validate_safe_token "unsafe value"
+expect_fail "token PowerShell syntax rejected" ucsi_validate_safe_token '$(Get-ChildItem)'
+
+# =====================================================================
+# (i) firmware stamp and reuse decision
+# =====================================================================
+echo "== firmware-cache =="
+assert_have_fn ucsi_compose_firmware_stamp
+STAMP="$(ucsi_compose_firmware_stamp arm-sha secure-sha patina-sha 2>/dev/null || true)"
+expect_eq "firmware stamp includes every firmware repository SHA" \
+    "armvirt=arm-sha secure-services=secure-sha patina-qemu=patina-sha" "$STAMP"
+
+assert_have_fn ucsi_can_reuse_firmware
+expect_pass "clean matching firmware can be reused" ucsi_can_reuse_firmware 0 0 1 1
+expect_fail "forced firmware cannot be reused" ucsi_can_reuse_firmware 1 0 1 1
+expect_fail "dirty firmware cannot be reused" ucsi_can_reuse_firmware 0 1 1 1
+expect_fail "missing artifacts cannot be reused" ucsi_can_reuse_firmware 0 0 0 1
+expect_fail "mismatched stamp cannot be reused" ucsi_can_reuse_firmware 0 0 1 0
+
+# =====================================================================
+# (j) cache containment
+# =====================================================================
+echo "== cache-containment =="
+assert_have_fn ucsi_path_within_repo
+PATH_TMP="$SCRIPT_DIR/.tmp-paths-$$"
+ROOT="$PATH_TMP/repo"
+mkdir -p "$ROOT/cache" "$PATH_TMP/repo-sibling" "$PATH_TMP/outside"
+expect_pass "cache inside repository accepted" ucsi_path_within_repo "$ROOT/cache" "$ROOT"
+expect_pass "repository root accepted" ucsi_path_within_repo "$ROOT" "$ROOT"
+expect_fail "sibling cache rejected" ucsi_path_within_repo "$PATH_TMP/repo-sibling" "$ROOT"
+expect_fail "prefix-trick cache rejected" ucsi_path_within_repo "$ROOT-not-really/cache" "$ROOT"
+expect_fail "outside cache rejected" ucsi_path_within_repo "$PATH_TMP/outside" "$ROOT"
+rm -rf "$PATH_TMP"
+
+# =====================================================================
+# (k) overlay cleanup and guestfish command selection
+# =====================================================================
+echo "== failure-preservation =="
+assert_have_fn ucsi_should_delete_overlay
+expect_fail "failed run preserves overlay" ucsi_should_delete_overlay 0 0
+expect_pass "verified success deletes overlay" ucsi_should_delete_overlay 1 0
+expect_fail "explicit keep preserves successful overlay" ucsi_should_delete_overlay 1 1
+
+echo "== guestfish-selection =="
+assert_have_fn ucsi_guestfish_command_for_euid
+expect_eq "root uses guestfish directly" "guestfish" \
+    "$(ucsi_guestfish_command_for_euid 0 2>/dev/null || true)"
+expect_eq "non-root uses passwordless sudo" "sudo -n guestfish" \
+    "$(ucsi_guestfish_command_for_euid 1000 2>/dev/null || true)"
+
+# =====================================================================
+# (l) workflow and devcontainer contracts
+# =====================================================================
+echo "== static-contracts =="
+expect_contains "workflow declares dispatch nonce" "$WORKFLOW" '^[[:space:]]+dispatch_nonce:'
+expect_contains "workflow run-name incorporates nonce" "$WORKFLOW" '^run-name:.*dispatch_nonce'
+expect_contains "workflow passes ValidationOS URL through env" "$WORKFLOW" 'VALIDATION_OS_URL:.*inputs\.validation_os_url'
+expect_contains "PowerShell reads ValidationOS URL from env" "$WORKFLOW" '\$env:VALIDATION_OS_URL'
+expect_not_contains "workflow does not log the ValidationOS URL" "$WORKFLOW" \
+    'Write-Host.*\$isoUrl'
+expect_contains "workflow passes drivers repo through env" "$WORKFLOW" 'DRIVERS_REPO:.*inputs\.drivers_repo'
+expect_contains "PowerShell reads drivers repo from env" "$WORKFLOW" '\$env:DRIVERS_REPO'
+expect_contains "workflow passes smoke repo through env" "$WORKFLOW" 'SMOKE_REPO:.*inputs\.smoke_repo'
+expect_contains "PowerShell reads smoke repo from env" "$WORKFLOW" '\$env:SMOKE_REPO'
+expect_contains "workflow passes smoke release through env" "$WORKFLOW" 'SMOKE_RELEASE:.*inputs\.smoke_release'
+expect_contains "PowerShell reads smoke release from env" "$WORKFLOW" '\$env:SMOKE_RELEASE'
+expect_not_contains "PowerShell does not quote expressions into source" "$WORKFLOW" \
+    "= '[^']*\\$\\{\\{[[:space:]]*inputs\\.(validation_os_url|drivers_repo|smoke_repo|smoke_release|dispatch_nonce)"
+expect_contains "devcontainer pins vncdotool" "$DOCKERFILE" 'vncdotool==1\.3\.0'
+expect_contains "devcontainer pins Pillow" "$DOCKERFILE" 'Pillow==12\.3\.0'
+assert_have_fn ucsi_require_devcontainer_tools
+expect_not_contains "dispatch polling does not sleep" "$PROD" '^[[:space:]]*sleep[[:space:]]'
+expect_not_contains "dispatch fallback does not select latest branch run" "$PROD" \
+    'gh run list.*--branch.*--limit 1'
+expect_contains "smoke typing failure is guarded" "$PROD" \
+    'if ! ucsi_type_smoke_command'
 
 # =====================================================================
 echo

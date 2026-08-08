@@ -11,6 +11,7 @@
 #
 
 name: build_os_image
+run-name: build_os_image [${{ inputs.dispatch_nonce || github.run_id }}]
 
 permissions:
   contents: read
@@ -45,6 +46,11 @@ on:
         required: false
         default: 'latest'
         type: string
+      dispatch_nonce:
+        description: 'Unique safe token used to identify this dispatched run'
+        required: false
+        default: ''
+        type: string
   workflow_call:
     inputs:
       git_ref:
@@ -71,6 +77,11 @@ on:
         required: false
         default: 'latest'
         type: string
+      dispatch_nonce:
+        description: 'Unique safe token used to identify this invocation'
+        required: false
+        default: ''
+        type: string
 
 concurrency:
   group: build_os_image-${{ github.head_ref || github.run_id }}
@@ -90,6 +101,39 @@ jobs:
         with:
           ref: ${{ inputs.git_ref || github.ref }}
 
+      - name: Validate workflow inputs
+        env:
+          VALIDATION_OS_URL: ${{ inputs.validation_os_url || 'https://aka.ms/DownloadValidationOS_arm64' }}
+          DRIVERS_REPO: ${{ inputs.drivers_repo || 'OpenDevicePartnership/odp-windows-drivers' }}
+          SMOKE_REPO: ${{ inputs.smoke_repo || 'dymk/odp-platform-common' }}
+          SMOKE_RELEASE: ${{ inputs.smoke_release || 'latest' }}
+          DISPATCH_NONCE: ${{ inputs.dispatch_nonce || '' }}
+        run: |
+          $repoPattern = '^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9][A-Za-z0-9._-]*$'
+          $safeTokenPattern = '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'
+
+          if ($env:DRIVERS_REPO -notmatch $repoPattern) {
+            throw 'drivers_repo must be a safe OWNER/REPO value'
+          }
+          if ($env:SMOKE_REPO -notmatch $repoPattern) {
+            throw 'smoke_repo must be a safe OWNER/REPO value'
+          }
+          if ($env:SMOKE_RELEASE -notmatch $safeTokenPattern) {
+            throw 'smoke_release contains unsupported characters'
+          }
+          if ($env:DISPATCH_NONCE -and $env:DISPATCH_NONCE -notmatch $safeTokenPattern) {
+            throw 'dispatch_nonce contains unsupported characters'
+          }
+
+          $validationOsUri = $null
+          if (-not [Uri]::TryCreate(
+              $env:VALIDATION_OS_URL,
+              [UriKind]::Absolute,
+              [ref]$validationOsUri
+            ) -or $validationOsUri.Scheme -notin @('http', 'https')) {
+            throw 'validation_os_url must be an absolute HTTP or HTTPS URL'
+          }
+
       - name: Resolve driver assets
         run: |
           $assetNames = Get-Content -Path 'postbuild\os\prebuilt\driverlist.txt' |
@@ -107,13 +151,14 @@ jobs:
       - name: Download driver assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DRIVERS_REPO: ${{ inputs.drivers_repo || 'OpenDevicePartnership/odp-windows-drivers' }}
         run: |
           if (-not (Test-Path $env:DRIVER_ASSET_NAMES_FILE)) {
             throw "Driver asset list '$env:DRIVER_ASSET_NAMES_FILE' does not exist"
           }
 
           $assetNames = Get-Content -Path $env:DRIVER_ASSET_NAMES_FILE
-          $driversRepo = '${{ inputs.drivers_repo || 'OpenDevicePartnership/odp-windows-drivers' }}'
+          $driversRepo = $env:DRIVERS_REPO
 
           # Drivers are published as zip assets on the rolling 'latest' release
           # (unlike workflow artifacts, gh does not auto-extract them), so each
@@ -136,18 +181,22 @@ jobs:
           }
 
       - name: Download Validation OS ISO
+        env:
+          VALIDATION_OS_URL: ${{ inputs.validation_os_url || 'https://aka.ms/DownloadValidationOS_arm64' }}
         run: |
           $ProgressPreference = 'SilentlyContinue'
-          $isoUrl = '${{ inputs.validation_os_url || 'https://aka.ms/DownloadValidationOS_arm64' }}'
-          Write-Host "Downloading Validation OS ISO from $isoUrl"
+          $isoUrl = $env:VALIDATION_OS_URL
+          Write-Host 'Downloading Validation OS ISO'
           Invoke-WebRequest $isoUrl -OutFile 'ValidationOS.iso'
 
       - name: Download UCSI smoke app
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SMOKE_REPO: ${{ inputs.smoke_repo || 'dymk/odp-platform-common' }}
+          SMOKE_RELEASE: ${{ inputs.smoke_release || 'latest' }}
         run: |
-          $smokeRepo = '${{ inputs.smoke_repo || 'dymk/odp-platform-common' }}'
-          $smokeRelease = '${{ inputs.smoke_release || 'latest' }}'
+          $smokeRepo = $env:SMOKE_REPO
+          $smokeRelease = $env:SMOKE_RELEASE
           $zip = Join-Path $env:RUNNER_TEMP 'ec-test-apps-ARM64.zip'
           $dest = Join-Path $env:RUNNER_TEMP 'ucsi-smoke-app'
           Write-Host "Downloading ec-test-apps-ARM64.zip from ${smokeRepo}@${smokeRelease}"

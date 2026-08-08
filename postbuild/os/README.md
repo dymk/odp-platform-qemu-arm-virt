@@ -45,6 +45,11 @@ or import a pre-built image instead of dispatching the workflow:
     scripts/run-ucsi-windows-e2e.sh --image path/to/os-image.vhdx \
       --validation-os-build 28000
 
+The cache directory must resolve inside this repository so it is available at
+the matching `/workspaces/<repo>` path in the devcontainer. Rebuild the
+devcontainer after dependency changes. Non-root hosts must allow passwordless
+`sudo -n guestfish` so result extraction cannot prompt after a long run.
+
 Run `scripts/run-ucsi-windows-e2e.sh --help` for the full option list. Unit
 tests for the runner's pure logic live in
 `scripts/tests/run-ucsi-windows-e2e-test.sh`.
