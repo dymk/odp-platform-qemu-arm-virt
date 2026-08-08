@@ -28,10 +28,14 @@ Windbg can be connected on  `windbg -k com:ipport=56789,port=127.0.0.1 -v`
 `scripts/run-ucsi-windows-e2e.sh` drives the full Windows UCSI path
 (`ucsi-smoke.exe -> ectest.sys -> ECT0.USND -> FFixedHw/FFAC -> Windows FF-A
 -> secure UCSI SP`). It builds/reuses the firmware, dispatches the
-`build_os_image` workflow (which injects the `ectest` driver and the smoke app),
-caches the resulting image by a deterministic key, boots a disposable qcow2
-overlay, and asserts both the guest success line and the secure UCSI UUID in the
-boot log.
+`build_os_image` workflow (which builds the dedicated
+`postbuild/os/ucsi-smoke` crate and injects it with the `ectest` driver), caches
+the resulting image by a deterministic key, boots a disposable qcow2 overlay,
+and asserts both the guest success line and the secure UCSI UUID in the boot
+log. Driver releases default to `latest`, but the runner resolves every
+required ZIP to its immutable asset ID and SHA-256 digest before computing the
+cache key or dispatching the workflow; use `--drivers-release TAG` to select a
+specific release.
 
 The public ValidationOS (build `26100.x`) lacks ACPI FF-A support, so the runner
 refuses any build `< 28000`. Declare the build explicitly:

@@ -59,15 +59,110 @@ ucsi_validate_os_build() {
     [ "$build" -ge "$UCSI_MIN_BUILD" ]
 }
 
-# ucsi_compute_cache_key SOURCE_ID OS_BUILD DRIVERS_REPO SMOKE_REPO \
-#                        SMOKE_RELEASE WORKFLOW_REPO WORKFLOW_REF WORKFLOW_SHA \
-#                        WORKFLOW_HASH
+# ucsi_compute_cache_key SOURCE_ID OS_BUILD DRIVERS_REPO DRIVERS_RELEASE \
+#                        DRIVER_ASSET_IDENTITY WORKFLOW_REPO WORKFLOW_REF \
+#                        WORKFLOW_SHA WORKFLOW_HASH
 # Deterministic hex digest over every input that must invalidate a cached
 # image. Each argument occupies its own line so field order and boundaries are
 # unambiguous; any change to any field changes the digest.
 ucsi_compute_cache_key() {
     [ "$#" -eq 9 ] || return 2
     printf '%s\n' "$@" | sha256sum | awk '{print $1}'
+}
+
+ucsi_resolve_driver_asset_manifest() {
+    local release_json="${1-}"
+    shift || return 1
+    [ "$#" -gt 0 ] || return 1
+    python3 -c '
+import json
+import re
+import sys
+
+try:
+    release = json.load(sys.stdin)
+except (json.JSONDecodeError, TypeError):
+    sys.exit(1)
+
+assets = release.get("assets")
+if not isinstance(assets, list):
+    sys.exit(1)
+
+by_name = {}
+for asset in assets:
+    if not isinstance(asset, dict):
+        continue
+    name = asset.get("name")
+    if isinstance(name, str):
+        if name in by_name:
+            sys.exit(1)
+        by_name[name] = asset
+
+manifest = []
+for driver in sorted(set(sys.argv[1:])):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", driver):
+        sys.exit(1)
+    name = driver + ".zip"
+    asset = by_name.get(name)
+    if asset is None:
+        sys.exit(1)
+    asset_id = asset.get("id")
+    digest = asset.get("digest")
+    if not isinstance(asset_id, int) or asset_id <= 0:
+        sys.exit(1)
+    if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", digest):
+        sys.exit(1)
+    manifest.append({
+        "name": name,
+        "id": asset_id,
+        "digest": digest.lower(),
+    })
+
+print(json.dumps(manifest, separators=(",", ":")))
+' "$@" <<< "$release_json"
+}
+
+ucsi_driver_asset_identity() {
+    local manifest="${1-}"
+    [ -n "$manifest" ] || return 1
+    printf 'driver-assets:%s\n' "$(printf '%s' "$manifest" | sha256sum | awk '{print $1}')"
+}
+
+ucsi_driver_release_endpoint() {
+    local repo="$1" release="$2"
+    printf 'repos/%s/releases/tags/%s\n' "$repo" "$release"
+}
+
+ucsi_validate_image() {
+    local image="$1" expected_format="$2" info
+    [ -f "$image" ] || return 1
+    info="$(qemu-img info --output=json "$image" 2>/dev/null)" || return 1
+    python3 -c '
+import json
+import sys
+
+try:
+    info = json.load(sys.stdin)
+except json.JSONDecodeError:
+    sys.exit(1)
+sys.exit(0 if info.get("format") == sys.argv[1] else 1)
+' "$expected_format" <<< "$info" || return 1
+    if [ "$expected_format" = qcow2 ]; then
+        qemu-img check -q "$image" >/dev/null 2>&1 || return 1
+    fi
+}
+
+ucsi_atomic_convert() {
+    local source_format="$1" source="$2" final="$3"
+    local temporary="${final}.tmp.$$.$RANDOM"
+    (
+        set -e
+        trap 'rm -f -- "$temporary"' EXIT HUP INT TERM
+        qemu-img convert -f "$source_format" -O qcow2 "$source" "$temporary"
+        ucsi_validate_image "$temporary" qcow2
+        mv -f -- "$temporary" "$final"
+        trap - EXIT HUP INT TERM
+    )
 }
 
 # ucsi_select_cached_image CACHE_DIR KEY
@@ -77,12 +172,18 @@ ucsi_compute_cache_key() {
 ucsi_select_cached_image() {
     local cache_dir="$1" key="$2"
     if [ -f "$cache_dir/$key.qcow2" ]; then
-        printf '%s\n' "$cache_dir/$key.qcow2"
-        return 0
+        if ucsi_validate_image "$cache_dir/$key.qcow2" qcow2; then
+            printf '%s\n' "$cache_dir/$key.qcow2"
+            return 0
+        fi
+        rm -f -- "$cache_dir/$key.qcow2"
     fi
     if [ -f "$cache_dir/$key.vhdx" ]; then
-        printf '%s\n' "$cache_dir/$key.vhdx"
-        return 0
+        if ucsi_validate_image "$cache_dir/$key.vhdx" vhdx; then
+            printf '%s\n' "$cache_dir/$key.vhdx"
+            return 0
+        fi
+        rm -f -- "$cache_dir/$key.vhdx"
     fi
     return 1
 }
@@ -216,8 +317,7 @@ Source (exactly one required):
 Options:
   --cache-dir DIR               Default: <repo>/postbuild/os/build/ucsi-windows-e2e-cache
   --drivers-repo OWNER/REPO     Default: OpenDevicePartnership/odp-windows-drivers
-  --smoke-repo OWNER/REPO       Default: dymk/odp-platform-common
-  --smoke-release TAG           Default: latest
+  --drivers-release TAG         Driver release tag. Default: latest
   --workflow-repo OWNER/REPO    Default: inferred from the 'dymk' remote,
                                 else dymk/odp-platform-qemu-arm-virt
   --workflow-ref REF            Default: current branch
@@ -272,6 +372,12 @@ ucsi_require_tools() {
     fi
 }
 
+ucsi_dc() { "$UCSI_REPO_ROOT/scripts/dc-run.sh" -- "$@"; }
+
+ucsi_ensure_devcontainer() {
+    make -C "$UCSI_REPO_ROOT" builder-image
+}
+
 ucsi_require_devcontainer_tools() {
     if ! ucsi_dc sh -c 'command -v vncdo >/dev/null 2>&1'; then
         ucsi_die "vncdo is missing inside the devcontainer; rebuild it after installing vncdotool==1.3.0"
@@ -301,10 +407,11 @@ ucsi_select_guestfish() {
     UCSI_GUESTFISH_CMD=(sudo -n guestfish)
 }
 
-# ucsi_port_free PORT -> 0 if nothing is listening on 127.0.0.1:PORT
+# ucsi_port_free PORT -> 0 if nothing is listening inside the devcontainer.
 ucsi_port_free() {
     local port="$1"
-    ! timeout 1 bash -c ": > /dev/tcp/127.0.0.1/$port" 2>/dev/null
+    [[ "$port" =~ ^[0-9]+$ ]] || return 1
+    ! ucsi_dc timeout 1 bash -c ': > /dev/tcp/127.0.0.1/"$1"' bash "$port" 2>/dev/null
 }
 
 ucsi_require_ports_free() {
@@ -399,17 +506,33 @@ ucsi_resolve_workflow_sha() {
     printf '%s\n' "$sha"
 }
 
+ucsi_resolve_driver_assets() {
+    local repo="$1" release="$2" driver_list="$3"
+    local endpoint release_json
+    endpoint="$(ucsi_driver_release_endpoint "$repo" "$release")"
+    release_json="$(gh api "$endpoint" 2>/dev/null)" \
+        || ucsi_die "could not resolve driver release $repo@$release"
+
+    local required=()
+    mapfile -t required < <(
+        sed -e 's/[[:space:]]*#.*$//' -e '/^[[:space:]]*$/d' "$driver_list"
+    )
+    [ "${#required[@]}" -gt 0 ] || ucsi_die "no required drivers listed in $driver_list"
+    ucsi_resolve_driver_asset_manifest "$release_json" "${required[@]}" \
+        || ucsi_die "driver release $repo@$release is missing a required asset, ID, or SHA-256 digest"
+}
+
 # Dispatches build_os_image and prints the resolved numeric run ID.
 ucsi_dispatch_workflow() {
-    local repo="$1" ref="$2" vos_url="$3" drivers_repo="$4" smoke_repo="$5"
-    local smoke_release="$6" nonce="$7" expected_sha="$8"
+    local repo="$1" ref="$2" vos_url="$3" drivers_repo="$4" drivers_release="$5"
+    local driver_manifest="$6" nonce="$7" expected_sha="$8"
     local out run_id="" matched_id
     ucsi_log "dispatching $UCSI_WORKFLOW_ID on $repo@$ref"
     out="$(gh workflow run "$UCSI_WORKFLOW_ID" --repo "$repo" --ref "$ref" \
         -f "validation_os_url=$vos_url" \
         -f "drivers_repo=$drivers_repo" \
-        -f "smoke_repo=$smoke_repo" \
-        -f "smoke_release=$smoke_release" \
+        -f "drivers_release=$drivers_release" \
+        -f "driver_asset_manifest=$driver_manifest" \
         -f "dispatch_nonce=$nonce" 2>&1)" || ucsi_die "gh workflow run failed: $out"
 
     run_id="$(ucsi_parse_run_id "$out" || true)"
@@ -452,7 +575,7 @@ ucsi_download_artifact_vhdx() {
 ucsi_resolve_base_image() {
     local cache_dir="$1" key="$2" force="$3" image_path="$4"
     local vos_url="$5" workflow_repo="$6" workflow_ref="$7"
-    local drivers_repo="$8" smoke_repo="$9" smoke_release="${10}" nonce="${11}"
+    local drivers_repo="$8" drivers_release="$9" driver_manifest="${10}" nonce="${11}"
     local workflow_sha="${12}"
     local base_qcow2="$cache_dir/$key.qcow2"
     mkdir -p "$cache_dir"
@@ -466,7 +589,7 @@ ucsi_resolve_base_image() {
                     printf '%s\n' "$cached"; return 0 ;;
                 *.vhdx)
                     ucsi_log "image cache hit (vhdx); converting to base qcow2"
-                    qemu-img convert -f vhdx -O qcow2 "$cached" "$base_qcow2"
+                    ucsi_atomic_convert vhdx "$cached" "$base_qcow2"
                     printf '%s\n' "$base_qcow2"; return 0 ;;
             esac
         fi
@@ -475,8 +598,8 @@ ucsi_resolve_base_image() {
     if [ -n "$image_path" ]; then
         ucsi_log "importing supplied image into cache: $image_path"
         case "$image_path" in
-            *.qcow2) qemu-img convert -f qcow2 -O qcow2 "$image_path" "$base_qcow2" ;;
-            *.vhdx)  qemu-img convert -f vhdx  -O qcow2 "$image_path" "$base_qcow2" ;;
+            *.qcow2) ucsi_atomic_convert qcow2 "$image_path" "$base_qcow2" ;;
+            *.vhdx)  ucsi_atomic_convert vhdx  "$image_path" "$base_qcow2" ;;
             *) ucsi_die "unsupported --image type: $image_path (expected .qcow2 or .vhdx)" ;;
         esac
         printf '%s\n' "$base_qcow2"; return 0
@@ -484,16 +607,14 @@ ucsi_resolve_base_image() {
 
     local run_id vhdx
     run_id="$(ucsi_dispatch_workflow "$workflow_repo" "$workflow_ref" "$vos_url" \
-        "$drivers_repo" "$smoke_repo" "$smoke_release" "$nonce" "$workflow_sha")"
+        "$drivers_repo" "$drivers_release" "$driver_manifest" "$nonce" "$workflow_sha")"
     vhdx="$(ucsi_download_artifact_vhdx "$workflow_repo" "$run_id" "$cache_dir/artifact-$run_id")"
     ucsi_log "converting downloaded VHDX to base qcow2"
-    qemu-img convert -f vhdx -O qcow2 "$vhdx" "$base_qcow2"
+    ucsi_atomic_convert vhdx "$vhdx" "$base_qcow2"
     printf '%s\n' "$base_qcow2"
 }
 
 # ---- VNC automation (runs vncdo/Pillow inside the devcontainer) ----
-ucsi_dc() { "$UCSI_REPO_ROOT/scripts/dc-run.sh" -- "$@"; }
-
 ucsi_vncdo() {
     ucsi_dc vncdo -s "${UCSI_VNC_HOST}:${UCSI_VNC_DISPLAY}" "$@"
 }
@@ -578,7 +699,7 @@ ucsi_extract_guest_result() {
 ucsi_main() {
     local validation_os_url="" image_path="" os_build=""
     local cache_dir="" drivers_repo="OpenDevicePartnership/odp-windows-drivers"
-    local smoke_repo="dymk/odp-platform-common" smoke_release="latest"
+    local drivers_release="latest"
     local workflow_repo="" workflow_ref=""
     local force_image=0 force_firmware=0 boot_timeout=900 keep_run_image=0
 
@@ -589,8 +710,7 @@ ucsi_main() {
             --validation-os-build) os_build="$2"; shift 2 ;;
             --cache-dir) cache_dir="$2"; shift 2 ;;
             --drivers-repo) drivers_repo="$2"; shift 2 ;;
-            --smoke-repo) smoke_repo="$2"; shift 2 ;;
-            --smoke-release) smoke_release="$2"; shift 2 ;;
+            --drivers-release) drivers_release="$2"; shift 2 ;;
             --workflow-repo) workflow_repo="$2"; shift 2 ;;
             --workflow-ref) workflow_ref="$2"; shift 2 ;;
             --force-image) force_image=1; shift ;;
@@ -640,12 +760,10 @@ build 26100 lacks ACPI FF-A support and cannot pass, even with a custom --image.
 
     ucsi_validate_repo_name "$drivers_repo" \
         || ucsi_die "--drivers-repo must be OWNER/REPO using only letters, digits, '.', '_', or '-'"
-    ucsi_validate_repo_name "$smoke_repo" \
-        || ucsi_die "--smoke-repo must be OWNER/REPO using only letters, digits, '.', '_', or '-'"
     ucsi_validate_repo_name "$workflow_repo" \
         || ucsi_die "--workflow-repo must be OWNER/REPO using only letters, digits, '.', '_', or '-'"
-    ucsi_validate_safe_token "$smoke_release" \
-        || ucsi_die "--smoke-release contains unsupported characters"
+    ucsi_validate_safe_token "$drivers_release" \
+        || ucsi_die "--drivers-release contains unsupported characters"
 
     cache_dir="$(realpath -m -- "$cache_dir")"
     if ! ucsi_path_within_repo "$cache_dir" "$UCSI_REPO_ROOT"; then
@@ -653,11 +771,13 @@ build 26100 lacks ACPI FF-A support and cannot pass, even with a custom --image.
     fi
 
     ucsi_require_tools
+    ucsi_ensure_devcontainer
     ucsi_require_devcontainer_tools
     ucsi_select_guestfish
 
     # ---- deterministic cache key ----
     local source_id workflow_hash workflow_sha cache_key dispatch_nonce
+    local driver_manifest driver_asset_identity
     if [ -n "$image_path" ]; then
         source_id="$(ucsi_image_identity "$image_path")"
     else
@@ -665,8 +785,11 @@ build 26100 lacks ACPI FF-A support and cannot pass, even with a custom --image.
     fi
     workflow_sha="$(ucsi_resolve_workflow_sha "$workflow_repo" "$workflow_ref")"
     workflow_hash="$(sha256sum "$UCSI_REPO_ROOT/$UCSI_WORKFLOW_FILE" | awk '{print $1}')"
+    driver_manifest="$(ucsi_resolve_driver_assets "$drivers_repo" "$drivers_release" \
+        "$UCSI_REPO_ROOT/postbuild/os/prebuilt/driverlist.txt")"
+    driver_asset_identity="$(ucsi_driver_asset_identity "$driver_manifest")"
     cache_key="$(ucsi_compute_cache_key "$source_id" "$os_build" "$drivers_repo" \
-        "$smoke_repo" "$smoke_release" "$workflow_repo" "$workflow_ref" \
+        "$drivers_release" "$driver_asset_identity" "$workflow_repo" "$workflow_ref" \
         "$workflow_sha" "$workflow_hash")"
     ucsi_log "cache key: $cache_key"
     ucsi_log "workflow source: $workflow_repo@$workflow_sha"
@@ -682,7 +805,7 @@ build 26100 lacks ACPI FF-A support and cannot pass, even with a custom --image.
     local base_image
     base_image="$(ucsi_resolve_base_image "$cache_dir" "$cache_key" "$force_image" \
         "$image_path" "$validation_os_url" "$workflow_repo" "$workflow_ref" \
-        "$drivers_repo" "$smoke_repo" "$smoke_release" "$dispatch_nonce" "$workflow_sha")"
+        "$drivers_repo" "$drivers_release" "$driver_manifest" "$dispatch_nonce" "$workflow_sha")"
     ucsi_log "base image: $base_image"
 
     # ---- disposable overlay with a relative backing path ----

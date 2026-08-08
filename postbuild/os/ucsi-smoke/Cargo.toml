@@ -1,0 +1,11 @@
+[package]
+name = "ucsi-smoke"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.88"
+
+[dependencies]
+ec-test-lib = { git = "https://github.com/dymk/odp-platform-common.git", rev = "53c3b6bce6d8f8c359ff0ded9884232d481ee7b1" }
+
+[workspace]
