@@ -319,6 +319,35 @@ ucsi_path_within_repo() {
     esac
 }
 
+ucsi_resolve_confined_cache_entry() {
+    local path="$1" cache_root="$2" resolved
+    [ ! -L "$path" ] && [ -e "$path" ] || return 1
+    resolved="$(realpath -e -- "$path")" || return 1
+    ucsi_path_within_repo "$resolved" "$cache_root" || return 1
+    printf '%s\n' "$resolved"
+}
+
+ucsi_ensure_confined_cache_dir() {
+    local cache_root="$1" path="$2" resolved
+    [ ! -L "$path" ] || return 1
+    if [ -e "$path" ]; then
+        [ -d "$path" ] || return 1
+    else
+        mkdir -- "$path" || return 1
+    fi
+    resolved="$(ucsi_resolve_confined_cache_entry "$path" "$cache_root")" \
+        || return 1
+    [ -d "$resolved" ] || return 1
+    printf '%s\n' "$resolved"
+}
+
+ucsi_confined_cache_path_available() {
+    local path="$1" cache_root="$2" resolved
+    [ ! -e "$path" ] && [ ! -L "$path" ] || return 1
+    resolved="$(realpath -m -- "$path")" || return 1
+    ucsi_path_within_repo "$resolved" "$cache_root"
+}
+
 ucsi_should_delete_overlay() {
     local verified_success="$1" keep_requested="$2"
     [ "$verified_success" = "1" ] && [ "$keep_requested" = "0" ]
@@ -338,7 +367,8 @@ ucsi_kernel_cache_path() {
 ucsi_select_supermin_kernel() {
     local candidate
     for candidate in "${1-}" "${2-}"; do
-        if [ -n "$candidate" ] && [ -s "$candidate" ] && [ -r "$candidate" ]; then
+        if [ -n "$candidate" ] && [ ! -L "$candidate" ] \
+            && [ -s "$candidate" ] && [ -r "$candidate" ]; then
             printf '%s\n' "$candidate"
             return 0
         fi
@@ -364,6 +394,30 @@ ucsi_find_extracted_kernel() {
         && [ -r "${candidates[0]}" ] \
         || return 1
     printf '%s\n' "${candidates[0]}"
+}
+
+ucsi_validate_cached_kernel() {
+    local cache_dir="$1" release="$2" cache_file="$3"
+    local cache_root kernel_root kernels_root release_root resolved_file
+
+    ucsi_validate_kernel_release "$release" || return 1
+    cache_root="$(realpath -e -- "$cache_dir")" || return 1
+    [ -d "$cache_root" ] || return 1
+    kernel_root="$(ucsi_resolve_confined_cache_entry \
+        "$cache_root/libguestfs" "$cache_root")" || return 1
+    [ -d "$kernel_root" ] || return 1
+    kernels_root="$(ucsi_resolve_confined_cache_entry \
+        "$kernel_root/kernels" "$cache_root")" || return 1
+    [ -d "$kernels_root" ] || return 1
+    release_root="$(ucsi_resolve_confined_cache_entry \
+        "$kernels_root/$release" "$cache_root")" || return 1
+    [ -d "$release_root" ] || return 1
+    resolved_file="$(ucsi_resolve_confined_cache_entry \
+        "$cache_file" "$cache_root")" || return 1
+    [ -f "$resolved_file" ] \
+        && [ "$resolved_file" = "$release_root/vmlinuz-$release" ] \
+        || return 1
+    printf '%s\n' "$resolved_file"
 }
 
 # ucsi_relative_backing_path OVERLAY_PATH BASE_PATH
@@ -491,9 +545,12 @@ ucsi_apt_download_command() {
 }
 
 ucsi_remove_guestfish_work_dir() {
-    local work_dir temp_root
+    local work_dir temp_root cache_root
+    [ "$#" -eq 3 ] || return 1
     work_dir="$(realpath -m -- "$1")" || return 1
     temp_root="$(realpath -m -- "$2")" || return 1
+    cache_root="$(realpath -e -- "$3")" || return 1
+    ucsi_path_within_repo "$temp_root" "$cache_root" || return 1
     case "$work_dir" in
         "$temp_root"/prepare-*) rm -rf -- "$work_dir" ;;
         *) return 1 ;;
@@ -502,7 +559,8 @@ ucsi_remove_guestfish_work_dir() {
 
 ucsi_cache_running_kernel() {
     local cache_dir="$1" release="$2" cache_file="$3"
-    local downloader package kernel_root temp_root work_dir publish_tmp=""
+    local downloader package cache_root kernel_root kernels_root release_root
+    local temp_root work_dir publish_tmp=""
     local extracted_kernel packages
 
     ucsi_is_debian_family \
@@ -514,22 +572,42 @@ ucsi_cache_running_kernel() {
 
     package="$(ucsi_kernel_package_name "$release")" \
         || ucsi_die "unsupported running kernel release: $release"
-    kernel_root="$cache_dir/libguestfs"
-    mkdir -p -- "$(dirname "$cache_file")" "$kernel_root/tmp"
-    kernel_root="$(realpath -e -- "$kernel_root")" \
-        || ucsi_die "could not resolve libguestfs cache directory"
-    ucsi_path_within_repo "$kernel_root" "$cache_dir" \
-        || ucsi_die "libguestfs cache escaped the runner cache directory"
-    temp_root="$(realpath -e -- "$kernel_root/tmp")" \
-        || ucsi_die "could not resolve libguestfs temporary directory"
+    cache_root="$(realpath -e -- "$cache_dir")" \
+        || ucsi_die "could not resolve runner cache directory"
+    [ -d "$cache_root" ] \
+        || ucsi_die "runner cache path is not a directory"
+    kernel_root="$(ucsi_ensure_confined_cache_dir \
+        "$cache_root" "$cache_root/libguestfs")" \
+        || ucsi_die "libguestfs cache directory is not confined to the runner cache"
+    temp_root="$(ucsi_ensure_confined_cache_dir \
+        "$cache_root" "$kernel_root/tmp")" \
+        || ucsi_die "libguestfs temporary directory is not confined to the runner cache"
+    kernels_root="$(ucsi_ensure_confined_cache_dir \
+        "$cache_root" "$kernel_root/kernels")" \
+        || ucsi_die "kernel cache directory is not confined to the runner cache"
+    release_root="$(ucsi_ensure_confined_cache_dir \
+        "$cache_root" "$kernels_root/$release")" \
+        || ucsi_die "kernel release cache is not confined to the runner cache"
+    [ ! -L "$cache_file" ] \
+        || ucsi_die "cached kernel must not be a symlink"
+    [ "$(realpath -m -- "$cache_file")" = "$release_root/vmlinuz-$release" ] \
+        || ucsi_die "cached kernel path is not confined to its release directory"
+    if [ -e "$cache_file" ]; then
+        ucsi_validate_cached_kernel "$cache_root" "$release" "$cache_file" \
+            >/dev/null \
+            || ucsi_die "existing cached kernel is not confined to the runner cache"
+    fi
+    cache_file="$release_root/vmlinuz-$release"
     work_dir="$temp_root/prepare-$release-$$-$RANDOM"
     mkdir -- "$work_dir"
     work_dir="$(realpath -e -- "$work_dir")" \
         || ucsi_die "could not resolve libguestfs kernel work directory"
+    ucsi_path_within_repo "$work_dir" "$temp_root" \
+        || ucsi_die "libguestfs kernel work directory escaped its temporary root"
 
     (
         set -e
-        trap 'rm -f -- "$publish_tmp"; ucsi_remove_guestfish_work_dir "$work_dir" "$temp_root"' EXIT
+        trap 'rm -f -- "$publish_tmp"; ucsi_remove_guestfish_work_dir "$work_dir" "$temp_root" "$cache_root"' EXIT
         trap 'exit 129' HUP
         trap 'exit 130' INT
         trap 'exit 143' TERM
@@ -550,6 +628,8 @@ ucsi_cache_running_kernel() {
             || ucsi_die "$package did not contain a readable, nonempty vmlinuz-$release"
 
         publish_tmp="${cache_file}.tmp.$$.$RANDOM"
+        ucsi_confined_cache_path_available "$publish_tmp" "$cache_root" \
+            || ucsi_die "temporary cached kernel path is not confined to the runner cache"
         cp -- "$extracted_kernel" "$publish_tmp"
         chmod u+rw -- "$publish_tmp"
         [ -s "$publish_tmp" ] && [ -r "$publish_tmp" ] \
@@ -558,18 +638,27 @@ ucsi_cache_running_kernel() {
         publish_tmp=""
     )
 
+    cache_file="$(ucsi_validate_cached_kernel "$cache_root" "$release" "$cache_file")" \
+        || ucsi_die "cached kernel is not confined to the runner cache"
     ucsi_select_supermin_kernel "" "$cache_file" \
         || ucsi_die "cached kernel is not readable and nonempty: $cache_file"
 }
 
 ucsi_preflight_guestfish() {
-    local cache_dir="$1" temp_root image log
-    temp_root="$cache_dir/libguestfs/tmp"
-    mkdir -p -- "$temp_root"
-    temp_root="$(realpath -e -- "$temp_root")" \
-        || ucsi_die "could not resolve libguestfs temporary directory"
+    local cache_dir="$1" cache_root kernel_root temp_root image log
+    cache_root="$(realpath -e -- "$cache_dir")" \
+        || ucsi_die "could not resolve runner cache directory"
+    kernel_root="$(ucsi_ensure_confined_cache_dir \
+        "$cache_root" "$cache_root/libguestfs")" \
+        || ucsi_die "libguestfs cache directory is not confined to the runner cache"
+    temp_root="$(ucsi_ensure_confined_cache_dir \
+        "$cache_root" "$kernel_root/tmp")" \
+        || ucsi_die "libguestfs temporary directory is not confined to the runner cache"
     image="$temp_root/preflight-$$-$RANDOM.img"
     log="$temp_root/preflight-$$-$RANDOM.log"
+    ucsi_confined_cache_path_available "$image" "$cache_root" \
+        && ucsi_confined_cache_path_available "$log" "$cache_root" \
+        || ucsi_die "guestfish preflight paths are not confined to the runner cache"
 
     if ! (
         trap 'rm -f -- "$image" "$log"' EXIT
@@ -602,6 +691,11 @@ ucsi_prepare_guestfish() {
     mkdir -p -- "$cache_dir"
     cache_file="$(ucsi_kernel_cache_path "$cache_dir" "$release")"
     system_kernel="/boot/vmlinuz-$release"
+    if [ -e "$cache_file" ] || [ -L "$cache_file" ]; then
+        cache_file="$(ucsi_validate_cached_kernel \
+            "$cache_dir" "$release" "$cache_file")" \
+            || ucsi_die "cached kernel is not confined to the runner cache"
+    fi
     kernel="$(ucsi_select_supermin_kernel "$system_kernel" "$cache_file" || true)"
     if [ -z "$kernel" ]; then
         kernel="$(ucsi_cache_running_kernel "$cache_dir" "$release" "$cache_file")"

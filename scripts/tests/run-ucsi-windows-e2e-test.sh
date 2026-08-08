@@ -512,6 +512,73 @@ expect_fail "empty cached kernel is rejected" \
     ucsi_select_supermin_kernel "$KERNEL_TMP/files/system" "$KERNEL_TMP/files/cached"
 rm -rf "$KERNEL_TMP"
 
+fake_cache_running_kernel() (
+    local cache_dir="$1" release=6.8.0-test cache_file
+    cache_file="$(ucsi_kernel_cache_path "$cache_dir" "$release")"
+
+    ucsi_is_debian_family() { return 0; }
+    ucsi_apt_download_command() { printf 'fake_apt\n'; }
+    fake_apt() { printf 'package' > "$2.deb"; }
+    dpkg-deb() {
+        mkdir -p "$3/boot"
+        printf 'extracted-kernel' > "$3/boot/vmlinuz-$release"
+    }
+
+    ucsi_cache_running_kernel "$cache_dir" "$release" "$cache_file"
+)
+
+echo "== guestfish-kernel-cache-confinement =="
+KERNEL_TMP="$SCRIPT_DIR/.tmp-guestfish-cache-$$"
+
+mkdir -p "$KERNEL_TMP/normal/cache"
+expect_pass "normal kernel cache creation succeeds" \
+    fake_cache_running_kernel "$KERNEL_TMP/normal/cache"
+expect_pass "normal cached kernel is reusable" \
+    ucsi_select_supermin_kernel "" \
+        "$KERNEL_TMP/normal/cache/libguestfs/kernels/6.8.0-test/vmlinuz-6.8.0-test"
+
+mkdir -p "$KERNEL_TMP/symlinked-tmp/cache/libguestfs" \
+    "$KERNEL_TMP/symlinked-tmp/outside"
+ln -s "$KERNEL_TMP/symlinked-tmp/outside" \
+    "$KERNEL_TMP/symlinked-tmp/cache/libguestfs/tmp"
+expect_fail "symlinked kernel temporary root is rejected" \
+    fake_cache_running_kernel "$KERNEL_TMP/symlinked-tmp/cache"
+
+mkdir -p "$KERNEL_TMP/symlinked-kernels/cache/libguestfs" \
+    "$KERNEL_TMP/symlinked-kernels/outside"
+ln -s "$KERNEL_TMP/symlinked-kernels/outside" \
+    "$KERNEL_TMP/symlinked-kernels/cache/libguestfs/kernels"
+expect_fail "symlinked kernels root is rejected" \
+    fake_cache_running_kernel "$KERNEL_TMP/symlinked-kernels/cache"
+
+mkdir -p "$KERNEL_TMP/symlinked-release/cache/libguestfs/kernels" \
+    "$KERNEL_TMP/symlinked-release/outside"
+ln -s "$KERNEL_TMP/symlinked-release/outside" \
+    "$KERNEL_TMP/symlinked-release/cache/libguestfs/kernels/6.8.0-test"
+expect_fail "symlinked kernel release directory is rejected" \
+    fake_cache_running_kernel "$KERNEL_TMP/symlinked-release/cache"
+
+mkdir -p "$KERNEL_TMP/symlinked-file/cache/libguestfs/kernels/6.8.0-test"
+printf 'outside-kernel' > "$KERNEL_TMP/symlinked-file/outside-kernel"
+ln -s "$KERNEL_TMP/symlinked-file/outside-kernel" \
+    "$KERNEL_TMP/symlinked-file/cache/libguestfs/kernels/6.8.0-test/vmlinuz-6.8.0-test"
+expect_fail "symlinked cached kernel is rejected" \
+    fake_cache_running_kernel "$KERNEL_TMP/symlinked-file/cache"
+
+mkdir -p "$KERNEL_TMP/symlinked-cleanup/cache" \
+    "$KERNEL_TMP/symlinked-cleanup/outside/prepare-test"
+ln -s "$KERNEL_TMP/symlinked-cleanup/outside" \
+    "$KERNEL_TMP/symlinked-cleanup/cache/tmp"
+expect_fail "cleanup rejects a temporary root outside the cache" \
+    ucsi_remove_guestfish_work_dir \
+        "$KERNEL_TMP/symlinked-cleanup/cache/tmp/prepare-test" \
+        "$KERNEL_TMP/symlinked-cleanup/cache/tmp" \
+        "$KERNEL_TMP/symlinked-cleanup/cache"
+expect_pass "rejected cleanup preserves the outside directory" \
+    test -d "$KERNEL_TMP/symlinked-cleanup/outside/prepare-test"
+
+rm -rf "$KERNEL_TMP"
+
 assert_have_fn ucsi_kernel_package_name
 expect_eq "running kernel maps to its Debian image package" \
     "linux-image-6.8.0-test" "$(ucsi_kernel_package_name 6.8.0-test 2>/dev/null || true)"
