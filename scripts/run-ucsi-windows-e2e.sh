@@ -152,6 +152,36 @@ sys.exit(0 if info.get("format") == sys.argv[1] else 1)
     fi
 }
 
+ucsi_validate_supplied_image() {
+    local image="$1" expected_format info
+    case "$image" in
+        *.qcow2) expected_format=qcow2 ;;
+        *.vhdx) expected_format=vhdx ;;
+        *) return 2 ;;
+    esac
+    [ -f "$image" ] || return 1
+    info="$(qemu-img info --output=json "$image" 2>/dev/null)" || return 1
+    python3 -c '
+import json
+import sys
+
+try:
+    info = json.load(sys.stdin)
+except (json.JSONDecodeError, TypeError):
+    sys.exit(1)
+
+if info.get("format") != sys.argv[1]:
+    sys.exit(1)
+if sys.argv[1] == "qcow2" and any(
+    info.get(field) for field in ("backing-filename", "full-backing-filename")
+):
+    sys.exit(1)
+' "$expected_format" <<< "$info" || return 1
+    if [ "$expected_format" = qcow2 ]; then
+        qemu-img check -q "$image" >/dev/null 2>&1 || return 1
+    fi
+}
+
 ucsi_atomic_convert() {
     local source_format="$1" source="$2" final="$3"
     local temporary="${final}.tmp.$$.$RANDOM"
@@ -213,7 +243,7 @@ ucsi_dispatch_run_title() {
 }
 
 ucsi_select_nonce_run_id() {
-    local json="${1-}" nonce="${2-}" expected_sha="${3-}"
+    local json="${1-}" nonce="${2-}" expected_sha="${3-}" expected_id="${4-}"
     [ -n "$json" ] && [ -n "$nonce" ] && [ -n "$expected_sha" ] || return 1
     python3 -c '
 import json
@@ -221,6 +251,7 @@ import sys
 
 expected = "build_os_image [%s]" % sys.argv[1]
 expected_sha = sys.argv[2]
+expected_id = sys.argv[3] or None
 try:
     runs = json.load(sys.stdin)
 except (json.JSONDecodeError, TypeError):
@@ -235,11 +266,26 @@ for run in runs:
         and run.get("headSha") == expected_sha
     ):
         run_id = run.get("databaseId")
-        if isinstance(run_id, int):
+        if isinstance(run_id, int) and not isinstance(run_id, bool) and (
+            expected_id is None or str(run_id) == expected_id
+        ):
             print(run_id)
             sys.exit(0)
 sys.exit(1)
-' "$nonce" "$expected_sha" <<< "$json"
+' "$nonce" "$expected_sha" "$expected_id" <<< "$json"
+}
+
+ucsi_verify_url_run_id() {
+    local json="${1-}" run_id="${2-}" nonce="${3-}" expected_sha="${4-}"
+    [[ "$run_id" =~ ^[0-9]+$ ]] || return 1
+    ucsi_select_nonce_run_id "$json" "$nonce" "$expected_sha" "$run_id"
+}
+
+ucsi_workflow_sha_matches_local_head() {
+    local workflow_sha="${1-}" local_head="${2-}"
+    [[ "$workflow_sha" =~ ^[0-9a-fA-F]{40}$ ]] \
+        && [[ "$local_head" =~ ^[0-9a-fA-F]{40}$ ]] \
+        && [ "${workflow_sha,,}" = "${local_head,,}" ]
 }
 
 ucsi_validate_repo_name() {
@@ -546,7 +592,14 @@ ucsi_dispatch_workflow() {
             runs_json="$(gh run list --repo "$repo" --workflow "$UCSI_WORKFLOW_ID" \
                 --limit 50 --json databaseId,event,displayTitle,headSha 2>/dev/null || true)"
         fi
-        if matched_id="$(ucsi_select_nonce_run_id "$runs_json" "$nonce" "$expected_sha")"; then
+        if [ -n "$run_id" ]; then
+            matched_id="$(ucsi_verify_url_run_id \
+                "$runs_json" "$run_id" "$nonce" "$expected_sha" || true)"
+        else
+            matched_id="$(ucsi_select_nonce_run_id \
+                "$runs_json" "$nonce" "$expected_sha" || true)"
+        fi
+        if [ -n "$matched_id" ]; then
             printf '%s\n' "$matched_id"
             return 0
         fi
@@ -554,7 +607,13 @@ ucsi_dispatch_workflow() {
             read -r -t 2 _ < <(timeout 3 tail -f /dev/null) || true
         fi
     done
-    ucsi_die "could not resolve workflow_dispatch run with title '$(ucsi_dispatch_run_title "$nonce")'"
+    if [ -n "$run_id" ]; then
+        ucsi_die "workflow run $run_id did not match event workflow_dispatch, title \
+'$(ucsi_dispatch_run_title "$nonce")', and head SHA $expected_sha. The branch may have moved; \
+push it or select a matching --workflow-ref."
+    fi
+    ucsi_die "could not resolve workflow_dispatch run with title \
+'$(ucsi_dispatch_run_title "$nonce")' and head SHA $expected_sha"
 }
 
 ucsi_download_artifact_vhdx() {
@@ -771,19 +830,37 @@ build 26100 lacks ACPI FF-A support and cannot pass, even with a custom --image.
     fi
 
     ucsi_require_tools
+
+    local workflow_sha local_head
+    workflow_sha="$(ucsi_resolve_workflow_sha "$workflow_repo" "$workflow_ref")"
+    if [ -n "$validation_os_url" ]; then
+        local_head="$(git -C "$UCSI_REPO_ROOT" rev-parse HEAD 2>/dev/null || true)"
+        if ! ucsi_workflow_sha_matches_local_head "$workflow_sha" "$local_head"; then
+            ucsi_die "$workflow_repo@$workflow_ref resolves to $workflow_sha, but local HEAD is \
+$local_head. Push the branch or select a --workflow-ref that resolves to local HEAD."
+        fi
+    fi
+    if [ -n "$image_path" ]; then
+        case "$image_path" in
+            *.qcow2|*.vhdx) ;;
+            *) ucsi_die "unsupported --image type: $image_path (expected .qcow2 or .vhdx)" ;;
+        esac
+        ucsi_validate_supplied_image "$image_path" \
+            || ucsi_die "supplied --image is invalid; QCOW2 images must be flat with no backing file"
+    fi
+
     ucsi_ensure_devcontainer
     ucsi_require_devcontainer_tools
     ucsi_select_guestfish
 
     # ---- deterministic cache key ----
-    local source_id workflow_hash workflow_sha cache_key dispatch_nonce
+    local source_id workflow_hash cache_key dispatch_nonce
     local driver_manifest driver_asset_identity
     if [ -n "$image_path" ]; then
         source_id="$(ucsi_image_identity "$image_path")"
     else
         source_id="url:$validation_os_url"
     fi
-    workflow_sha="$(ucsi_resolve_workflow_sha "$workflow_repo" "$workflow_ref")"
     workflow_hash="$(sha256sum "$UCSI_REPO_ROOT/$UCSI_WORKFLOW_FILE" | awk '{print $1}')"
     driver_manifest="$(ucsi_resolve_driver_assets "$drivers_repo" "$drivers_release" \
         "$UCSI_REPO_ROOT/postbuild/os/prebuilt/driverlist.txt")"

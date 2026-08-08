@@ -184,6 +184,15 @@ expect_eq "image identity is the full SHA-256" \
     "image:$(sha256sum "$IMAGE_TMP/a/same.qcow2" | awk '{print $1}')" "$image_a"
 rm -rf "$IMAGE_TMP"
 
+# URL-based builds must execute the same commit as the local top-level tree.
+assert_have_fn ucsi_workflow_sha_matches_local_head
+LOCAL_HEAD='1111111111111111111111111111111111111111'
+expect_pass "matching workflow SHA and local HEAD accepted" \
+    ucsi_workflow_sha_matches_local_head "$LOCAL_HEAD" "$LOCAL_HEAD"
+expect_fail "remote workflow SHA differing from local HEAD rejected" \
+    ucsi_workflow_sha_matches_local_head \
+    '2222222222222222222222222222222222222222' "$LOCAL_HEAD"
+
 # =====================================================================
 # (c) immutable driver asset manifest and identity
 # =====================================================================
@@ -238,6 +247,27 @@ if command -v qemu-img >/dev/null 2>&1; then
     expect_eq "valid qcow2 is selected" "$CACHE_TMP/$KEY.qcow2" "$selected"
 fi
 rm -rf "$CACHE_TMP"
+
+# A caller-supplied QCOW2 must be a standalone image, never an overlay.
+assert_have_fn ucsi_validate_supplied_image
+if command -v qemu-img >/dev/null 2>&1; then
+    SUPPLIED_TMP="$SCRIPT_DIR/.tmp-supplied-$$"
+    mkdir -p "$SUPPLIED_TMP"
+    qemu-img create -q -f qcow2 "$SUPPLIED_TMP/flat.qcow2" 1M
+    qemu-img create -q -f qcow2 "$SUPPLIED_TMP/base.qcow2" 1M
+    qemu-img create -q -f qcow2 -b "$SUPPLIED_TMP/base.qcow2" -F qcow2 \
+        "$SUPPLIED_TMP/overlay.qcow2"
+    qemu-img create -q -f vhdx "$SUPPLIED_TMP/flat.vhdx" 1M
+    expect_pass "flat supplied QCOW2 accepted" \
+        ucsi_validate_supplied_image "$SUPPLIED_TMP/flat.qcow2"
+    expect_fail "backed supplied QCOW2 rejected" \
+        ucsi_validate_supplied_image "$SUPPLIED_TMP/overlay.qcow2"
+    expect_pass "supplied VHDX accepted" \
+        ucsi_validate_supplied_image "$SUPPLIED_TMP/flat.vhdx"
+    rm -rf "$SUPPLIED_TMP"
+else
+    echo "  SKIP: supplied-image backing test (qemu-img unavailable)"
+fi
 
 # =====================================================================
 # (e) atomic cache publication
@@ -339,6 +369,31 @@ expect_fail "rejects nonce title on non-dispatch event" ucsi_select_nonce_run_id
 expect_fail "rejects matching nonce from a different source SHA" ucsi_select_nonce_run_id \
     "$(printf '[{"databaseId":66,"event":"workflow_dispatch","displayTitle":"%s","headSha":"2222222222222222222222222222222222222222"}]' "$TITLE")" \
     "$NONCE" "$WORKFLOW_SHA"
+
+# A run ID returned directly by `gh workflow run` is still untrusted until its
+# queried metadata matches the exact dispatch request.
+assert_have_fn ucsi_verify_url_run_id
+URL_RUN_JSON="$(printf \
+    '{"databaseId":77,"event":"workflow_dispatch","displayTitle":"%s","headSha":"%s"}' \
+    "$TITLE" "$WORKFLOW_SHA")"
+verified_id="$(ucsi_verify_url_run_id "$URL_RUN_JSON" 77 "$NONCE" "$WORKFLOW_SHA" 2>/dev/null || true)"
+expect_eq "URL-returned run with exact metadata accepted" "77" "$verified_id"
+expect_fail "URL-returned run with another source SHA rejected" \
+    ucsi_verify_url_run_id \
+    "$(printf '{"databaseId":77,"event":"workflow_dispatch","displayTitle":"%s","headSha":"2222222222222222222222222222222222222222"}' "$TITLE")" \
+    77 "$NONCE" "$WORKFLOW_SHA"
+expect_fail "URL-returned run with another title rejected" \
+    ucsi_verify_url_run_id \
+    "$(printf '{"databaseId":77,"event":"workflow_dispatch","displayTitle":"build_os_image [other]","headSha":"%s"}' "$WORKFLOW_SHA")" \
+    77 "$NONCE" "$WORKFLOW_SHA"
+expect_fail "URL-returned non-dispatch run rejected" \
+    ucsi_verify_url_run_id \
+    "$(printf '{"databaseId":77,"event":"push","displayTitle":"%s","headSha":"%s"}' "$TITLE" "$WORKFLOW_SHA")" \
+    77 "$NONCE" "$WORKFLOW_SHA"
+expect_fail "URL-returned metadata for another run ID rejected" \
+    ucsi_verify_url_run_id \
+    "$(printf '{"databaseId":78,"event":"workflow_dispatch","displayTitle":"%s","headSha":"%s"}' "$TITLE" "$WORKFLOW_SHA")" \
+    77 "$NONCE" "$WORKFLOW_SHA"
 
 # =====================================================================
 # (i) relative overlay backing path: never an absolute host-only path
