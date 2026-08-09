@@ -25,17 +25,17 @@ Windbg can be connected on  `windbg -k com:ipport=56789,port=127.0.0.1 -v`
 
 ## Windows UCSI ACPI -> FF-A end-to-end runner
 
-`scripts/run-ucsi-windows-e2e.sh` drives the full Windows UCSI path
-(`ucsi-smoke.exe -> ectest.sys -> ECT0.USND -> FFixedHw/FFAC -> Windows FF-A
--> secure UCSI SP`). It builds/reuses the firmware, dispatches the
-`build_os_image` workflow (which builds the dedicated
-`postbuild/os/ucsi-smoke` crate and injects it with the `ectest` driver), caches
-the resulting image by a deterministic key, boots a disposable qcow2 overlay,
-and asserts both the guest success line and the secure UCSI UUID in the boot
-log. Driver releases default to `latest`, but the runner resolves every
-required ZIP to its immutable asset ID and SHA-256 digest before computing the
-cache key or dispatching the workflow; use `--drivers-release TAG` to select a
-specific release.
+`scripts/run-ucsi-windows-e2e.sh` is a Linux-local pipeline for the full
+Windows UCSI path (`ucsi-smoke.exe -> ectest.sys -> ECT0.USND ->
+FFixedHw/FFAC -> Windows FF-A -> secure UCSI SP`). It builds or reuses the
+firmware, extracts the public ARM64 ValidationOS builder with rootless
+guestfish, builds the smoke executable with pinned cargo-xwin, and boots
+Windows unattended under headless QEMU to create the target image.
+
+The local builder applies `ValidationOS.wim`, injects the three drivers listed
+in `ucsi-driverlist.txt`, copies the current `ACPITABL.dat` and smoke
+executable, and creates the EFI/BCD files. Driver assets are resolved to
+immutable GitHub release asset IDs and SHA-256 digests before download.
 
 The public ValidationOS (build `26100.x`) lacks ACPI FF-A support, so the runner
 refuses any build `< 28000`. Declare the build explicitly:
@@ -44,10 +44,16 @@ refuses any build `< 28000`. Declare the build explicitly:
       --validation-os-url <ARM64-ValidationOS-ISO-URL> \
       --validation-os-build 28000
 
-or import a pre-built image instead of dispatching the workflow:
+Use `--validation-os-iso PATH` for a previously downloaded ISO, or import a
+prepared image:
 
     scripts/run-ucsi-windows-e2e.sh --image path/to/os-image.vhdx \
       --validation-os-build 28000
+
+`--image` accepts only a flat VHDX or QCOW2 and bypasses the local builder. The
+image must already contain the required drivers, `ACPITABL.dat`, and
+`C:\ucsi-smoke\ucsi-smoke.exe`; the runner still injects the unattended
+Winlogon Shell into a disposable overlay before boot.
 
 The cache directory must resolve inside this repository so it is available at
 the matching `/workspaces/<repo>` path in the devcontainer. Rebuild the
@@ -62,7 +68,7 @@ release-keyed cache below the runner cache directory. Later runs reuse that
 kernel without another package download. This requires `guestfish` and
 `supermin`; the fallback also requires `apt` (or `apt-get`) and `dpkg-deb`.
 The runner preflights the real libguestfs appliance before starting the
-long-running firmware and guest workflow.
+long-running firmware and Windows guests.
 
 Run `scripts/run-ucsi-windows-e2e.sh --help` for the full option list. Unit
 tests for the runner's pure logic live in
