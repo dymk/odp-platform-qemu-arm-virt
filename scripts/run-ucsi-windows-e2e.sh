@@ -627,14 +627,15 @@ for asset in json.load(sys.stdin):
 }
 
 ucsi_resolve_iso() {
-    local cache_dir="$1" url="$2" local_iso="$3" force="$4" target
+    local cache_dir="$1" url="$2" local_iso="$3" os_build="$4" force="$5" target
     if [ -n "$local_iso" ]; then
         [ -r "$local_iso" ] && [ -s "$local_iso" ] \
             || ucsi_die "ValidationOS ISO is unreadable or empty: $local_iso"
         realpath -e "$local_iso"
         return 0
     fi
-    target="$cache_dir/downloads/validationos-$(printf '%s' "$url" | sha256sum | awk '{print $1}').iso"
+    target="$cache_dir/downloads/validationos-$(printf '%s\n%s\n' "$url" "$os_build" \
+        | sha256sum | awk '{print $1}').iso"
     if [ "$force" = 1 ] || [ ! -s "$target" ]; then
         ucsi_log "downloading ValidationOS ISO"
         ucsi_atomic_download "$url" "$target" \
@@ -850,6 +851,14 @@ ucsi_validate_target_payload() {
         : is-file /ucsi-smoke/ucsi-smoke.exe)" = true ]
 }
 
+ucsi_publish_built_base() {
+    local target="$1" final="$2" run_dir="$3"
+    ucsi_validate_image "$target" qcow2 || return 1
+    mkdir -p "$(dirname "$final")" || return 1
+    mv -f -- "$target" "$final" || return 1
+    ucsi_remove_owned_tree "$run_dir"
+}
+
 ucsi_build_local_base() {
     local cache_dir="$1" key="$2" extracted="$3" drivers="$4"
     local acpi="$5" smoke="$6" final="$7" timeout_seconds="$8"
@@ -883,13 +892,20 @@ ucsi_build_local_base() {
         return 1
     fi
 
-    mkdir -p "$(dirname "$final")"
-    mv -f "$target" "$final"
-    rm -rf "$run_dir"
+    if ! ucsi_publish_built_base "$target" "$final" "$run_dir"; then
+        ucsi_warn "could not publish validated builder target; artifacts preserved at $run_dir"
+        return 1
+    fi
 }
 
 ucsi_run_registry_path() {
     printf '%s/smoke-shell.reg\n' "$1"
+}
+
+ucsi_remove_e2e_result() {
+    local image="$1"
+    guestfish -a "$image" run : mount /dev/sda3 / \
+        : rm-f /ucsi-e2e-result.txt
 }
 
 ucsi_prepare_run_overlay() {
@@ -897,6 +913,7 @@ ucsi_prepare_run_overlay() {
     registry="$(ucsi_run_registry_path "$run_dir")"
     ucsi_make_overlay "$overlay" "$base" qcow2
     guestfish -a "$overlay" run : ntfsfix /dev/sda3
+    ucsi_remove_e2e_result "$overlay" || return 1
     ucsi_write_shell_registry "$registry" 'cmd.exe /c C:\\ucsi-smoke\\ucsi-smoke.exe'
     ucsi_set_winlogon_shell "$overlay" "$registry"
 }
@@ -1028,7 +1045,7 @@ ucsi_main() {
     else
         local iso iso_identity extracted manifest drivers cargo_xwin smoke acpi
         iso="$(ucsi_resolve_iso "$cache_dir" "$validation_os_url" \
-            "$validation_os_iso" "$force_image")"
+            "$validation_os_iso" "$os_build" "$force_image")"
         iso_identity="$(ucsi_file_identity "$iso")" \
             || ucsi_die "ValidationOS ISO is empty or unreadable"
         extracted="$(ucsi_extract_validation_os "$cache_dir" "$iso" "$iso_identity")"

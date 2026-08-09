@@ -157,6 +157,25 @@ expect_pass "failed download publishes no final file" test ! -e "$SCRATCH/failed
 expect_fail "atomic download leaves no temporary sibling" \
     compgen -G "$SCRATCH/failed.iso.tmp.*"
 
+assert_have_fn ucsi_resolve_iso
+URL_CACHE="$SCRATCH/url-cache"
+printf 'rolling-v1' > "$SCRATCH/rolling.iso"
+url_build_28000="$(ucsi_resolve_iso "$URL_CACHE" \
+    "file://$SCRATCH/rolling.iso" "" 28000 0 2>/dev/null || true)"
+url_build_28001="$(ucsi_resolve_iso "$URL_CACHE" \
+    "file://$SCRATCH/rolling.iso" "" 28001 0 2>/dev/null || true)"
+expect_ne "same rolling ISO URL uses a distinct cache path for each declared build" \
+    "$url_build_28000" "$url_build_28001"
+printf 'rolling-v2' > "$SCRATCH/rolling.iso"
+url_cached="$(ucsi_resolve_iso "$URL_CACHE" \
+    "file://$SCRATCH/rolling.iso" "" 28000 0 2>/dev/null || true)"
+expect_eq "rolling ISO cache remains stable without force" \
+    "rolling-v1" "$(cat "$url_cached" 2>/dev/null || true)"
+url_forced="$(ucsi_resolve_iso "$URL_CACHE" \
+    "file://$SCRATCH/rolling.iso" "" 28000 1 2>/dev/null || true)"
+expect_eq "force-image refreshes the build-scoped rolling ISO cache" \
+    "rolling-v2" "$(cat "$url_forced" 2>/dev/null || true)"
+
 assert_have_fn ucsi_atomic_publish_directory
 mkdir -p "$SCRATCH/extracted-stage"
 printf wim > "$SCRATCH/extracted-stage/ValidationOS.wim"
@@ -246,6 +265,36 @@ if command -v guestfish >/dev/null 2>&1 && command -v qemu-img >/dev/null 2>&1; 
         guestfish --ro -a "$TARGET" run : mount /dev/sda1 / : exists /ODP_ESP.TAG
     expect_pass "OS marker exists" \
         guestfish --ro -a "$TARGET" run : mount /dev/sda3 / : exists /ODP_OS.TAG
+
+    assert_have_fn ucsi_remove_e2e_result
+    IMPORTED="$SCRATCH/imported-prepared.qcow2"
+    IMPORTED_BASE="$SCRATCH/imported-base.qcow2"
+    IMPORTED_OVERLAY="$SCRATCH/imported-overlay.qcow2"
+    guestfish -a "$TARGET" run : mount /dev/sda3 / \
+        : write /ucsi-e2e-result.txt "$UCSI_PASS_LINE"
+    expect_pass "prepared image imports into a pristine cached base" \
+        ucsi_atomic_convert qcow2 "$TARGET" "$IMPORTED_BASE"
+    expect_pass "imported prepared image gets a disposable overlay" \
+        ucsi_make_overlay "$IMPORTED_OVERLAY" "$IMPORTED_BASE" qcow2
+    expect_eq "imported prepared image overlay initially exposes stale PASS" true \
+        "$(guestfish --ro -a "$IMPORTED_OVERLAY" run : mount-ro /dev/sda3 / \
+            : is-file /ucsi-e2e-result.txt 2>/dev/null || true)"
+    expect_pass "final E2E preparation removes stale PASS from imported overlay" \
+        ucsi_remove_e2e_result "$IMPORTED_OVERLAY"
+    expect_eq "stale PASS is absent from disposable overlay" false \
+        "$(guestfish --ro -a "$IMPORTED_OVERLAY" run : mount-ro /dev/sda3 / \
+            : is-file /ucsi-e2e-result.txt 2>/dev/null || true)"
+    expect_eq "stale PASS remains untouched in imported cached base" true \
+        "$(guestfish --ro -a "$IMPORTED_BASE" run : mount-ro /dev/sda3 / \
+            : is-file /ucsi-e2e-result.txt 2>/dev/null || true)"
+    expect_pass "missing E2E result is accepted" \
+        ucsi_remove_e2e_result "$IMPORTED_OVERLAY"
+    printf 'not an image' > "$IMPORTED"
+    expect_fail "E2E result cleanup failure is reported before boot" \
+        ucsi_remove_e2e_result "$IMPORTED"
+    expect_contains "run overlay preparation requires stale-result cleanup" \
+        <(declare -f ucsi_prepare_run_overlay) \
+        'ucsi_remove_e2e_result "\$overlay".*\|\| return'
 else
     echo "  SKIP: guestfish/qemu-img unavailable"
 fi
@@ -283,6 +332,41 @@ expect_contains "batch writes exact PASS marker" "$BUILDER_BATCH" \
     '> *"%ROOT%\\build-result\.txt" +echo PASS: local image build'
 expect_contains "batch writes detailed build log" "$BUILDER_BATCH" \
     'C:\\ucsi-builder\\build\.log|%ROOT%\\build\.log'
+
+assert_have_fn ucsi_publish_built_base
+if command -v qemu-img >/dev/null 2>&1; then
+    PUBLISH_RUN="$SCRATCH/publish-failure-run"
+    PUBLISH_FINAL="$SCRATCH/published.qcow2"
+    mkdir -p "$PUBLISH_RUN"
+    printf 'builder evidence' > "$PUBLISH_RUN/builder-boot.log"
+    qemu-img create -q -f qcow2 "$PUBLISH_RUN/target.qcow2" 8M
+    mkdir -p "$PUBLISH_FINAL/target.qcow2"
+    expect_fail "failed atomic base publish returns nonzero" \
+        ucsi_publish_built_base "$PUBLISH_RUN/target.qcow2" \
+            "$PUBLISH_FINAL" "$PUBLISH_RUN"
+    expect_pass "failed atomic base publish preserves builder evidence directory" \
+        test -f "$PUBLISH_RUN/builder-boot.log"
+
+    INVALID_RUN="$SCRATCH/publish-invalid-run"
+    mkdir -p "$INVALID_RUN"
+    printf 'builder evidence' > "$INVALID_RUN/builder-boot.log"
+    printf 'not qcow2' > "$INVALID_RUN/target.qcow2"
+    expect_fail "invalid builder target is rejected before publication" \
+        ucsi_publish_built_base "$INVALID_RUN/target.qcow2" \
+            "$SCRATCH/invalid-published.qcow2" "$INVALID_RUN"
+    expect_pass "target validation failure preserves builder evidence directory" \
+        test -f "$INVALID_RUN/builder-boot.log"
+
+    SUCCESS_RUN="$SCRATCH/publish-success-run"
+    mkdir -p "$SUCCESS_RUN"
+    printf 'builder evidence' > "$SUCCESS_RUN/builder-boot.log"
+    qemu-img create -q -f qcow2 "$SUCCESS_RUN/target.qcow2" 8M
+    expect_pass "validated builder target publishes atomically" \
+        ucsi_publish_built_base "$SUCCESS_RUN/target.qcow2" \
+            "$SCRATCH/success-published.qcow2" "$SUCCESS_RUN"
+    expect_pass "builder evidence directory is removed only after successful publish" \
+        test ! -e "$SUCCESS_RUN"
+fi
 
 echo "== optional builder target wrapper =="
 CAPTURE="$SCRATCH/qemu-args.txt"
