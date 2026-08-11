@@ -1,3 +1,3 @@
-pl061gpio
-qemui2c
-ectest_kmdf
+driver-pl061gpio-ARM64-Release
+driver-qemui2c-ARM64-Release
+driver-ectest_kmdf-ARM64-Release

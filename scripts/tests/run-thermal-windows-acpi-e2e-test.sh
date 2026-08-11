@@ -63,7 +63,7 @@ expect_pass "EC sidecar marker is empty" bash -c \
 expect_exact_file "thermal service UUID is exact" "$ADAPTER/secure-uuid.txt" \
     "31f56da7-593c-4d72-a4b3-8fc7171ac073"
 expect_exact_file "thermal driver list is exact" "$ADAPTER/drivers.txt" \
-    $'pl061gpio\nqemui2c\nectest_kmdf'
+    $'driver-pl061gpio-ARM64-Release\ndriver-qemui2c-ARM64-Release\ndriver-ectest_kmdf-ARM64-Release'
 
 expect_pass "smoke manifest is isolated and exact" python3 - "$SMOKE/Cargo.toml" <<'PY'
 import sys
