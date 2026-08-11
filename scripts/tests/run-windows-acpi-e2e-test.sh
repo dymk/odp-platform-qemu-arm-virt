@@ -12,6 +12,7 @@ WRAPPER="$REPO_ROOT/scripts/qemu-ec-wrapper.sh"
 UEFI_MAKEFILE="$REPO_ROOT/mod/uefi/Makefile"
 BUILDER_BATCH="$REPO_ROOT/postbuild/os/windows-acpi-e2e/build-validationos.cmd"
 FIXTURE="$REPO_ROOT/postbuild/os/windows-acpi-e2e/test-adapter"
+README="$REPO_ROOT/postbuild/os/README.md"
 SCRATCH="$REPO_ROOT/postbuild/os/build/windows-acpi-e2e-tests-$$"
 
 TESTS_RUN=0
@@ -523,6 +524,24 @@ ln -s "$SCRATCH/cache-root/outside" "$SCRATCH/cache-root/symlink-cache"
 expect_fail "symlinked cache root is rejected" odp_e2e_cache_tree_safe "$SCRATCH/cache-root/symlink-cache" "$SCRATCH/cache-root"
 echo "== committed generic fixture and documentation =="
 expect_pass "committed fixture satisfies adapter contract" odp_e2e_load_adapter "$FIXTURE"
+expect_contracts "$FIXTURE/smoke/Cargo.toml" <<'EOF'
+has	fixture smoke uses generic guest support	^windows-acpi-e2e-guest-support = \{ path = "\.\./\.\./guest-support" \}$
+EOF
+expect_eq "fixture selects its custom ACPI entry" \
+    'postbuild/os/windows-acpi-e2e/test-adapter/fixture.asl' \
+    "$(cat "$FIXTURE/acpi-entry.txt" 2>/dev/null || true)"
+expect_contracts "$FIXTURE/fixture.asl" <<'EOF'
+has	fixture ACPI defines the smoke method	Method *\(TEST, *0
+has	fixture ACPI returns the smoke sentinel	Return *\(0x12345678\)
+EOF
+expect_contracts "$REPO_ROOT/mod/uefi/platform/QemuArmVirtPkg/AcpiTables/ec.asl" <<'EOF'
+lacks	platform ACPI remains fixture-free	Method *\(TEST
+EOF
+expect_contracts "$README" <<'EOF'
+has	README documents the adapter contract	Every adapter directory contains:
+has	README documents the sidecar contract	needs-ec-sidecar
+has	README documents the standard PASS contract	PASS: Windows ACPI E2E
+EOF
 
 echo
 printf 'ran %d checks, %d failed\n' "$TESTS_RUN" "$TESTS_FAILED"
