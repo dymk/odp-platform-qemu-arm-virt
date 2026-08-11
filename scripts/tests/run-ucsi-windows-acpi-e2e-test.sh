@@ -121,7 +121,7 @@ if [ -f "$GENERIC" ]; then
     # shellcheck source=/dev/null
     ODP_WINDOWS_ACPI_E2E_SOURCE_ONLY=1 source "$GENERIC"
 fi
-expect_pass "generic validator accepts UCSI adapter" odp_e2e_validate_adapter "$ADAPTER"
+expect_pass "generic loader accepts UCSI adapter" odp_e2e_load_adapter "$ADAPTER"
 
 echo "== UCSI platform and documentation =="
 expect_contains "focused ACPI table exposes UCSI method" "$EC_ASL" \
