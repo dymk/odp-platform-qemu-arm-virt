@@ -625,6 +625,22 @@ expect_contains "fixture remains Rust 1.90" "$FIXTURE/smoke/rust-toolchain.toml"
     'channel = "1\.90\.0"'
 expect_contains "fixture uses guest support" "$FIXTURE/smoke/Cargo.toml" \
     'windows-acpi-e2e-guest-support'
+expect_pass "fixture ACPI entry list exists" test -f "$FIXTURE/acpi-entry.txt"
+expect_eq "fixture selects its custom ACPI entry" \
+    'postbuild/os/windows-acpi-e2e/test-adapter/fixture.asl' \
+    "$(cat "$FIXTURE/acpi-entry.txt" 2>/dev/null || true)"
+expect_pass "fixture custom ACPI entry exists" test -f "$FIXTURE/fixture.asl"
+FIXTURE_INPUTS="$SCRATCH/fixture-inputs.txt"
+odp_e2e_collect_input_files "$FIXTURE" > "$FIXTURE_INPUTS"
+expect_contains "fixture custom ACPI entry participates in cache identity" \
+    "$FIXTURE_INPUTS" 'windows-acpi-e2e/test-adapter/fixture\.asl'
+expect_contains "fixture ACPI defines the smoke method" "$FIXTURE/fixture.asl" \
+    'Method *\(TEST, *0'
+expect_contains "fixture ACPI returns the smoke sentinel" "$FIXTURE/fixture.asl" \
+    'Return *\(0x12345678\)'
+expect_not_contains "platform ACPI remains fixture-free" \
+    "$REPO_ROOT/mod/uefi/platform/QemuArmVirtPkg/AcpiTables/ec.asl" \
+    'Method *\(TEST'
 expect_contains "README documents adapter directory" "$README" 'adapter'
 expect_contains "README documents standard success line" "$README" 'PASS: Windows ACPI E2E'
 expect_contains "README documents sidecar marker" "$README" 'needs-ec-sidecar'
