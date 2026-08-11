@@ -8,18 +8,14 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 GENERIC="$REPO_ROOT/scripts/run-windows-acpi-e2e.sh"
-LAUNCHER="$REPO_ROOT/scripts/run-ucsi-windows-acpi-e2e.sh"
 ADAPTER="$REPO_ROOT/postbuild/os/windows-acpi-e2e/adapters/ucsi"
 SMOKE="$ADAPTER/smoke"
 SOURCE="$SMOKE/src/main.rs"
 README="$ADAPTER/README.md"
 EC_ASL="$REPO_ROOT/mod/uefi/platform/QemuArmVirtPkg/AcpiTables/ec.asl"
-SCRATCH="$REPO_ROOT/postbuild/os/build/ucsi-adapter-tests-$$"
 
 TESTS_RUN=0
 TESTS_FAILED=0
-mkdir -p "$SCRATCH"
-trap 'rm -rf -- "$SCRATCH"' EXIT
 
 ok() {
     TESTS_RUN=$((TESTS_RUN + 1))
@@ -120,40 +116,7 @@ expect_not_contains "smoke does not implement result output" "$SOURCE" \
 expect_not_contains "smoke does not implement shutdown" "$SOURCE" \
     'shutdown|Command::new|std::process'
 
-echo "== UCSI launcher and generic integration =="
-expect_pass "launcher parses as shell" bash -n "$LAUNCHER"
-if [ -f "$LAUNCHER" ]; then
-    mkdir -p "$SCRATCH/repo/scripts"
-    cp "$LAUNCHER" "$SCRATCH/repo/scripts/run-ucsi-windows-acpi-e2e.sh"
-    cat > "$SCRATCH/repo/scripts/run-windows-acpi-e2e.sh" <<'SH'
-#!/usr/bin/env bash
-printf '%s\0' "$@" > "$ODP_E2E_ARGV_LOG"
-SH
-    chmod +x "$SCRATCH/repo/scripts/"*.sh
-    ARGV_LOG="$SCRATCH/argv"
-    ODP_E2E_ARGV_LOG="$ARGV_LOG" \
-        "$SCRATCH/repo/scripts/run-ucsi-windows-acpi-e2e.sh" \
-        --image "image with spaces.qcow2" --keep "" >/dev/null 2>&1
-    expect_pass "launcher preserves path and argv exactly" \
-        python3 - "$ARGV_LOG" "$SCRATCH/repo" <<'PY'
-import sys
-from pathlib import Path
-
-actual = Path(sys.argv[1]).read_bytes().split(b"\0")[:-1]
-expected = [
-    b"--adapter",
-    str(Path(sys.argv[2]) / "postbuild/os/windows-acpi-e2e/adapters/ucsi").encode(),
-    b"--image",
-    b"image with spaces.qcow2",
-    b"--keep",
-    b"",
-]
-assert actual == expected, (actual, expected)
-PY
-else
-    fail "launcher preserves path and argv exactly"
-fi
-
+echo "== UCSI generic integration =="
 if [ -f "$GENERIC" ]; then
     # shellcheck source=/dev/null
     ODP_WINDOWS_ACPI_E2E_SOURCE_ONLY=1 source "$GENERIC"
@@ -165,8 +128,10 @@ expect_contains "focused ACPI table exposes UCSI method" "$EC_ASL" \
     'Method\(USND, 1, Serialized\)'
 expect_contains "focused ACPI table uses UCSI UUID" "$EC_ASL" \
     '65467f50-827f-4e4f-8770-dbf4c3f77f45'
-expect_contains "UCSI README uses thin launcher" "$README" \
-    'scripts/run-ucsi-windows-acpi-e2e\.sh'
+expect_contains "UCSI README uses generic runner" "$README" \
+    'scripts/run-windows-acpi-e2e\.sh'
+expect_contains "UCSI README selects UCSI adapter" "$README" \
+    '--adapter postbuild/os/windows-acpi-e2e/adapters/ucsi'
 expect_contains "UCSI README states Windows build floor" "$README" '28000'
 expect_contains "UCSI README states dependency stack" "$README" \
     'generic harness.*#143.*#162'
