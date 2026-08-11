@@ -10,10 +10,10 @@ DefinitionBlock ("SsdtEc.aml", "SSDT", 2, "QEMUAR", "EC      ", 1) {
 
   Scope(\_SB)
   {
-    //#include "ffa.asl"
+    #include "ffa.asl"
     #include "hid.asl"
     //#include "battery.asl"
-    //#include "thermal.asl"
+    #include "thermal.asl"
     //#include "rtc.asl"
 
   //
