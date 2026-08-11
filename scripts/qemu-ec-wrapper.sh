@@ -50,15 +50,6 @@ QEMU_DISPLAY="${QEMU_DISPLAY:-}"
 # devcontainer forwards.
 QEMU_VNC="${QEMU_VNC:-127.0.0.1:0}"
 
-if [ "${UCSI_BUILDER_TARGET+x}" = x ] && [ -z "$UCSI_BUILDER_TARGET" ]; then
-    echo "qemu-ec-wrapper: UCSI_BUILDER_TARGET must not be empty" >&2
-    exit 2
-fi
-if [ "${UCSI_QEMU_PID_FILE+x}" = x ] && [ -z "$UCSI_QEMU_PID_FILE" ]; then
-    echo "qemu-ec-wrapper: UCSI_QEMU_PID_FILE must not be empty" >&2
-    exit 2
-fi
-
 # Version/help probes must not get extra device args appended.
 for arg in "$@"; do
     case "$arg" in
@@ -83,16 +74,5 @@ case "$QEMU_DISPLAY" in
     "")  : ;;
     *)   extra+=(-display "$QEMU_DISPLAY") ;;
 esac
-
-if [ "${UCSI_BUILDER_TARGET+x}" = x ]; then
-    extra+=(
-        -drive "if=none,id=ucsi-builder-target,file=${UCSI_BUILDER_TARGET},format=qcow2"
-        -device "nvme,drive=ucsi-builder-target,serial=ODPTARGET001"
-    )
-fi
-
-if [ "${UCSI_QEMU_PID_FILE+x}" = x ]; then
-    printf '%s\n' "$$" > "$UCSI_QEMU_PID_FILE"
-fi
 
 exec "$REAL_QEMU" "$@" "${extra[@]}"
