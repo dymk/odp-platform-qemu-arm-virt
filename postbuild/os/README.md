@@ -79,6 +79,18 @@ scripts/run-windows-acpi-e2e.sh \
   --validation-os-build 28000
 ```
 
+### Thermal adapter
+
+The thermal adapter enables the FF-A and thermal ACPI definitions and starts
+the EC sidecar. Run it with:
+
+```sh
+scripts/run-windows-acpi-e2e.sh \
+  --adapter postbuild/os/windows-acpi-e2e/adapters/thermal \
+  --validation-os-iso /path/to/ValidationOS.iso \
+  --validation-os-build 28000
+```
+
 Use exactly one of `--validation-os-url`, `--validation-os-iso`, or `--image`.
 `--image` accepts a flat VHDX or QCOW2 that already contains the adapter
 payload. `--cache-dir`, `--drivers-release`, `--force`,
