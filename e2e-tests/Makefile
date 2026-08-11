@@ -11,7 +11,6 @@ include ../Common.mk
 
 # Build output paths
 TARGET_DIR := target/aarch64-unknown-uefi/release
-TPM_EFI := $(TARGET_DIR)/tpm.efi
 
 # Two-QEMU EC-relay services. Each entry drives one generated vdrive +
 # relay-run-<svc> target below. The test EFI basename is the service key
@@ -35,10 +34,15 @@ EC_SERIAL_TIMEOUT  ?= $(QEMU_TIMEOUT)
 
 # Virtual drive directories for UEFI Shell to find test EFI binaries.
 # Each test runs in its own vdrive so the shared startup.nsh finds exactly
-# one binary (no parameterising the shell). Relay vdrives are generated
-# from RELAY_SERVICES below as Build/vdrive-<svc>; the single-QEMU TPM
-# path stages its own.
-VDRIVE_TPM_DIR := Build/vdrive-tpm
+# one binary (no parameterising the shell). Every service vdrive is
+# generated as Build/vdrive-<svc> (see svc-vdrive-rule below), shared by
+# the two-QEMU relay flow and the single-QEMU flow alike.
+#
+# Single-QEMU SP-service tests (no EC sidecar): deterministic services the
+# host drives directly, each run through the same test-sp-services.sh
+# runner. The test EFI basename is the service key with hyphens mapped to
+# underscores (Cargo bin names).
+SP_SERVICES := tpm ucsi
 
 # Shared generic UEFI shell startup script (runs the single .efi on the
 # vdrive), reused by every per-test vdrive so new service tests don't each
@@ -84,16 +88,13 @@ cp $(2) $(1)/
 cp $(STARTUP_NSH) $(1)/startup.nsh
 endef
 
-$(VDRIVE_TPM_DIR): build $(TPM_EFI) $(STARTUP_NSH)
-	$(call make-vdrive,$(VDRIVE_TPM_DIR),$(TPM_EFI))
-
-# Generate one vdrive rule per relay service: Build/vdrive-<svc> stages
-# <svc>'s EFI (hyphens -> underscores) with the shared startup.nsh.
-define relay-vdrive-rule
+# Generate one vdrive rule per service (relay or single-QEMU): Build/vdrive-<svc>
+# stages <svc>'s EFI (hyphens -> underscores) with the shared startup.nsh.
+define svc-vdrive-rule
 Build/vdrive-$(1): build $(TARGET_DIR)/$(subst -,_,$(1)).efi $(STARTUP_NSH)
 	$$(call make-vdrive,Build/vdrive-$(1),$(TARGET_DIR)/$(subst -,_,$(1)).efi)
 endef
-$(foreach svc,$(RELAY_SERVICES),$(eval $(call relay-vdrive-rule,$(svc))))
+$(foreach svc,$(sort $(RELAY_SERVICES) $(SP_SERVICES)),$(eval $(call svc-vdrive-rule,$(svc))))
 
 # ------------------------------------------------------------
 # Run tests with timeout, capture output, report results
@@ -107,24 +108,34 @@ $(COVERAGE_PLUGIN): builder-image
 	$(call ENDGROUP)
 
 .PHONY: test-sp-services
-test-sp-services: $(VDRIVE_TPM_DIR) $(COVERAGE_PLUGIN)
+test-sp-services:
+	@set -e; for svc in $(SP_SERVICES); do \
+		$(MAKE) sp-service-run-$$svc; \
+	done
+
+# Generate sp-service-run-<svc> for each SP_SERVICES entry: one single-QEMU
+# run of <svc> against Build/vdrive-<svc> through the shared runner
+# (scripts/test-sp-services.sh, no EC sidecar). Runs are invoked
+# sequentially by test-sp-services so concurrent QEMU instances never
+# collide on the shared Build/ logs or coverage.log.
+define sp-service-run-rule
+.PHONY: sp-service-run-$(1)
+sp-service-run-$(1): Build/vdrive-$(1) $(COVERAGE_PLUGIN)
 	@mkdir -p Build
-	@echo "=== Running SP services E2E tests (timeout=$(QEMU_TIMEOUT)s) ==="
-ifeq ($(SERIAL_TEE),1)
-else
-	@echo "    (serial output streaming to Build/test-output.log)"
-endif
-	$(call GROUP,SP services E2E tests)
-	@$(DC_RUN) -- scripts/test-sp-services.sh \
-		$(BIOS_FV_DIR) \
+	@echo "=== Running single-QEMU $(1) e2e (timeout=$$(QEMU_TIMEOUT)s) ==="
+	$$(call GROUP,Single-QEMU $(1) e2e)
+	@$$(DC_RUN) -- scripts/test-sp-services.sh \
+		$$(BIOS_FV_DIR) \
 		e2e-tests/Build \
-		e2e-tests/$(VDRIVE_TPM_DIR) \
-		e2e-tests/$(COVERAGE_PLUGIN) \
-		e2e-tests/$(COVERAGE_LOG) \
-		$(QEMU_TIMEOUT) \
-		$(SERIAL_TEE) \
-		-- $(QEMU_COMMON_ARGS)
-	$(call ENDGROUP)
+		e2e-tests/Build/vdrive-$(1) \
+		e2e-tests/$$(COVERAGE_PLUGIN) \
+		e2e-tests/$$(COVERAGE_LOG) \
+		$$(QEMU_TIMEOUT) \
+		$$(SERIAL_TEE) \
+		-- $$(QEMU_COMMON_ARGS)
+	$$(call ENDGROUP)
+endef
+$(foreach svc,$(SP_SERVICES),$(eval $(call sp-service-run-rule,$(svc))))
 
 # ------------------------------------------------------------
 # Two-QEMU EC-relay E2E tests (test-sp-ec-link)
