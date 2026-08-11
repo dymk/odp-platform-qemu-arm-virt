@@ -82,7 +82,7 @@ assert_have_fn() {
 make_adapter() {
     local root="$1" uuid="${2:-12345678-1234-4abc-8def-1234567890ab}"
     mkdir -p "$root/smoke/src"
-    printf '[workspace]\n\n[package]\nname = "fixture-smoke"\nversion = "0.1.0"\nedition = "2021"\n' \
+    printf '[[bin]]\nname = "smoke"\npath = "src/main.rs"\n\n[workspace]\n\n[package]\nname = "fixture-smoke"\nversion = "0.1.0"\nedition = "2021"\n' \
         > "$root/smoke/Cargo.toml"
     : > "$root/smoke/Cargo.lock"
     printf '[toolchain]\nchannel = "1.90.0"\n' > "$root/smoke/rust-toolchain.toml"
@@ -101,6 +101,17 @@ assert_have_fn odp_e2e_validate_adapter
 VALID_ADAPTER="$SCRATCH/valid-adapter"
 make_adapter "$VALID_ADAPTER"
 expect_pass "required adapter layout accepted" odp_e2e_validate_adapter "$VALID_ADAPTER"
+cp -a "$VALID_ADAPTER" "$SCRATCH/missing-smoke-bin"
+python3 -c '
+from pathlib import Path
+path = Path(__import__("sys").argv[1])
+text = path.read_text()
+start = text.index("[[bin]]")
+end = text.index("[workspace]")
+path.write_text(text[:start] + text[end:])
+' "$SCRATCH/missing-smoke-bin/smoke/Cargo.toml"
+expect_fail "adapter without explicit smoke bin rejected" \
+    odp_e2e_validate_adapter "$SCRATCH/missing-smoke-bin"
 for required in smoke/Cargo.toml smoke/Cargo.lock smoke/rust-toolchain.toml \
     smoke/src/main.rs drivers.txt secure-uuid.txt; do
     BROKEN="$SCRATCH/broken-${required//\//-}"
@@ -129,6 +140,26 @@ expect_fail "missing ACPI entry rejected" odp_e2e_validate_adapter "$VALID_ADAPT
 rm -f "$VALID_ADAPTER/acpi-entry.txt"
 printf '../outside\n' > "$VALID_ADAPTER/acpi-includes.txt"
 expect_fail "parent-traversing ACPI include rejected" odp_e2e_validate_adapter "$VALID_ADAPTER"
+rm -f "$VALID_ADAPTER/acpi-includes.txt"
+mkdir -p "$SCRATCH/symlink-target"
+printf 'DefinitionBlock() {}\n' > "$SCRATCH/symlink-target/table.asl"
+ln -s "$SCRATCH/symlink-target/table.asl" "$REPO_ROOT/postbuild/os/build/symlink-entry-$$.asl"
+printf 'postbuild/os/build/symlink-entry-%s.asl\n' "$$" > "$VALID_ADAPTER/acpi-entry.txt"
+expect_fail "symlinked ACPI entry rejected" odp_e2e_validate_adapter "$VALID_ADAPTER"
+rm -f "$VALID_ADAPTER/acpi-entry.txt" "$REPO_ROOT/postbuild/os/build/symlink-entry-$$.asl"
+ln -s "$SCRATCH/symlink-target" "$REPO_ROOT/postbuild/os/build/symlink-include-$$"
+printf 'postbuild/os/build/symlink-include-%s\n' "$$" > "$VALID_ADAPTER/acpi-includes.txt"
+expect_fail "symlinked ACPI include rejected" odp_e2e_validate_adapter "$VALID_ADAPTER"
+rm -f "$VALID_ADAPTER/acpi-includes.txt" "$REPO_ROOT/postbuild/os/build/symlink-include-$$"
+printf 'mod/uefi/platform/QemuArmVirtPkg/AcpiTables/ec.asl\n' \
+    > "$SCRATCH/symlink-entry-list"
+ln -s "$SCRATCH/symlink-entry-list" "$VALID_ADAPTER/acpi-entry.txt"
+expect_fail "symlinked ACPI entry list rejected" odp_e2e_validate_adapter "$VALID_ADAPTER"
+rm -f "$VALID_ADAPTER/acpi-entry.txt"
+printf 'mod/uefi/platform/QemuArmVirtPkg/AcpiTables\n' \
+    > "$SCRATCH/symlink-include-list"
+ln -s "$SCRATCH/symlink-include-list" "$VALID_ADAPTER/acpi-includes.txt"
+expect_fail "symlinked ACPI include list rejected" odp_e2e_validate_adapter "$VALID_ADAPTER"
 rm -f "$VALID_ADAPTER/acpi-includes.txt"
 
 assert_have_fn odp_e2e_validate_sources
@@ -211,6 +242,63 @@ expect_contains "cache inputs include guest support lockfile" "$COLLECTED_INPUTS
     'windows-acpi-e2e/guest-support/Cargo\.lock'
 expect_contains "cache inputs include all adapter smoke sources" "$COLLECTED_INPUTS" \
     'cache-adapter/smoke/src/cache-fixture\.rs'
+
+CUSTOM_ACPI="$SCRATCH/custom-acpi"
+CUSTOM_INCLUDE="$SCRATCH/custom-include"
+mkdir -p "$CUSTOM_ACPI" "$CUSTOM_INCLUDE/nested"
+printf 'DefinitionBlock() {}\n' > "$CUSTOM_ACPI/custom.asl"
+printf '#define CUSTOM_VALUE 1\n' > "$CUSTOM_INCLUDE/custom.inc"
+printf '#define NESTED_VALUE 1\n' > "$CUSTOM_INCLUDE/nested/nested.asi"
+printf '%s\n' "${CUSTOM_ACPI#"$REPO_ROOT/"}"'/custom.asl' \
+    > "$CACHE_ADAPTER/acpi-entry.txt"
+printf '%s\n' "${CUSTOM_INCLUDE#"$REPO_ROOT/"}" \
+    > "$CACHE_ADAPTER/acpi-includes.txt"
+odp_e2e_collect_input_files "$CACHE_ADAPTER" > "$COLLECTED_INPUTS"
+expect_contains "cache inputs include resolved custom ACPI entry" "$COLLECTED_INPUTS" \
+    'custom-acpi/custom\.asl'
+expect_contains "cache inputs include listed ACPI include sources recursively" \
+    "$COLLECTED_INPUTS" 'custom-include/nested/nested\.asi'
+custom_hash="$(odp_e2e_hash_inputs $(cat "$COLLECTED_INPUTS") 2>/dev/null || true)"
+printf 'DefinitionBlock() { Name (CHANGED, One) }\n' > "$CUSTOM_ACPI/custom.asl"
+odp_e2e_collect_input_files "$CACHE_ADAPTER" > "$COLLECTED_INPUTS"
+changed_entry_hash="$(odp_e2e_hash_inputs $(cat "$COLLECTED_INPUTS") 2>/dev/null || true)"
+expect_ne "custom ACPI entry change invalidates input identity" \
+    "$custom_hash" "$changed_entry_hash"
+printf 'DefinitionBlock() {}\n' > "$CUSTOM_ACPI/custom.asl"
+printf '#define CUSTOM_VALUE 2\n' > "$CUSTOM_INCLUDE/custom.inc"
+odp_e2e_collect_input_files "$CACHE_ADAPTER" > "$COLLECTED_INPUTS"
+changed_include_hash="$(odp_e2e_hash_inputs $(cat "$COLLECTED_INPUTS") 2>/dev/null || true)"
+expect_ne "custom ACPI include change invalidates input identity" \
+    "$custom_hash" "$changed_include_hash"
+
+ACPI_CACHE="$SCRATCH/acpi-cache"
+ACPI_BUILD_COUNT="$SCRATCH/acpi-build-count"
+printf 0 > "$ACPI_BUILD_COUNT"
+original_odp_e2e_dc="$(declare -f odp_e2e_dc)"
+odp_e2e_dc() {
+    local output="${6}" host_output count
+    host_output="$REPO_ROOT${output#"/workspaces/$(basename "$REPO_ROOT")"}"
+    count="$(cat "$ACPI_BUILD_COUNT")"
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$ACPI_BUILD_COUNT"
+    mkdir -p "$host_output"
+    printf 'ACPI build %s\n' "$count" > "$host_output/ACPITABL.dat"
+}
+printf '#define CUSTOM_VALUE 1\n' > "$CUSTOM_INCLUDE/custom.inc"
+odp_e2e_collect_input_files "$CACHE_ADAPTER" > "$COLLECTED_INPUTS"
+custom_hash="$(odp_e2e_hash_inputs $(cat "$COLLECTED_INPUTS") 2>/dev/null || true)"
+odp_e2e_build_acpi "$ACPI_CACHE" "$custom_hash" "$CACHE_ADAPTER" \
+    > "$SCRATCH/acpi-first-path"
+printf '#define CUSTOM_VALUE 3\n' > "$CUSTOM_INCLUDE/custom.inc"
+odp_e2e_collect_input_files "$CACHE_ADAPTER" > "$COLLECTED_INPUTS"
+changed_include_hash="$(odp_e2e_hash_inputs $(cat "$COLLECTED_INPUTS") 2>/dev/null || true)"
+odp_e2e_build_acpi "$ACPI_CACHE" "$changed_include_hash" "$CACHE_ADAPTER" \
+    > "$SCRATCH/acpi-second-path"
+expect_ne "changed custom ACPI source does not reuse stale cache path" \
+    "$(cat "$SCRATCH/acpi-first-path")" "$(cat "$SCRATCH/acpi-second-path")"
+expect_eq "changed custom ACPI source triggers a fresh compile" 2 \
+    "$(cat "$ACPI_BUILD_COUNT")"
+eval "$original_odp_e2e_dc"
 
 assert_have_fn odp_e2e_atomic_download
 printf payload > "$SCRATCH/source.iso"
@@ -309,6 +397,10 @@ expect_contains "adapter smoke release build uses cargo-xwin" "$PROD" \
     'cargo \+1\.90\.0 xwin build --locked --release --target aarch64-pc-windows-msvc'
 expect_not_contains "runner never invokes plain Windows cargo build" "$PROD" \
     'cargo \+1\.90\.0 build .*aarch64-pc-windows-msvc'
+expect_contains "fixture declares the smoke executable contract" \
+    "$FIXTURE/smoke/Cargo.toml" '^\[\[bin\]\]$'
+expect_contains "fixture executable is named smoke" \
+    "$FIXTURE/smoke/Cargo.toml" '^name = "smoke"$'
 
 echo "== target disk and builder contracts =="
 assert_have_fn odp_e2e_create_target_image
@@ -416,12 +508,52 @@ expect_fail "explicit empty EC PTY is rejected" \
 expect_contains "UEFI forwards optional EC PTY" "$UEFI_MAKEFILE" \
     'ODP_E2E_EC_PTY=\$\(ODP_E2E_EC_PTY\)'
 
+expect_pass "wrapper forwards explicit run-local EC sockets" \
+    env REAL_QEMU="$FAKE_QEMU" QEMU_CAPTURE="$CAPTURE" \
+    EC_I2C_SOCK=/workspaces/repo/run/ec-i2c.sock \
+    EC_GPIO_SOCK=/workspaces/repo/run/ec-gpio.sock QEMU_DISPLAY=none \
+    "$WRAPPER" -machine virt
+expect_contains "wrapper receives run-local I2C socket" "$CAPTURE" \
+    'path=/workspaces/repo/run/ec-i2c\.sock'
+expect_contains "wrapper receives run-local GPIO socket" "$CAPTURE" \
+    'path=/workspaces/repo/run/ec-gpio\.sock'
+
 echo "== optional EC sidecar =="
 assert_have_fn odp_e2e_adapter_needs_ec_sidecar
+assert_have_fn odp_e2e_ec_socket_paths
 rm -f "$VALID_ADAPTER/needs-ec-sidecar"
 expect_fail "adapter without marker skips sidecar" odp_e2e_adapter_needs_ec_sidecar "$VALID_ADAPTER"
 : > "$VALID_ADAPTER/needs-ec-sidecar"
 expect_pass "adapter marker selects sidecar" odp_e2e_adapter_needs_ec_sidecar "$VALID_ADAPTER"
+EXPECTED_EC_I2C="/workspaces/$(basename "$REPO_ROOT")${SCRATCH#"$REPO_ROOT"}/sidecar-run/ec-i2c.sock"
+EXPECTED_EC_GPIO="/workspaces/$(basename "$REPO_ROOT")${SCRATCH#"$REPO_ROOT"}/sidecar-run/ec-gpio.sock"
+mapfile -t EC_SOCKET_PATHS < <(odp_e2e_ec_socket_paths "$SCRATCH/sidecar-run" 2>/dev/null || true)
+expect_eq "sidecar I2C socket is run-local" \
+    "$EXPECTED_EC_I2C" "${EC_SOCKET_PATHS[0]-}"
+expect_eq "sidecar GPIO socket is run-local" \
+    "$EXPECTED_EC_GPIO" "${EC_SOCKET_PATHS[1]-}"
+mkdir -p "$SCRATCH/fake-bin" "$SCRATCH/sidecar-run"
+cat > "$SCRATCH/fake-bin/make" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > "$MAKE_CAPTURE"
+EOF
+chmod +x "$SCRATCH/fake-bin/make"
+PATH="$SCRATCH/fake-bin:$PATH" MAKE_CAPTURE="$SCRATCH/sidecar-make-args" \
+    odp_e2e_boot_qemu "$SCRATCH/image.qcow2" "" "$SCRATCH/sidecar-boot.log" 5 \
+    "$SCRATCH/sidecar-run" "" "$EXPECTED_EC_I2C" "$EXPECTED_EC_GPIO"
+expect_contains "host QEMU receives sidecar I2C socket" "$SCRATCH/sidecar-make-args" \
+    "^EC_I2C_SOCK=${EXPECTED_EC_I2C}$"
+expect_contains "host QEMU receives sidecar GPIO socket" "$SCRATCH/sidecar-make-args" \
+    "^EC_GPIO_SOCK=${EXPECTED_EC_GPIO}$"
+PATH="$SCRATCH/fake-bin:$PATH" MAKE_CAPTURE="$SCRATCH/plain-make-args" \
+    odp_e2e_boot_qemu "$SCRATCH/image.qcow2" "" "$SCRATCH/plain-boot.log" 5 \
+    "$SCRATCH/sidecar-run" "" "" ""
+expect_contains "host QEMU disables I2C socket without sidecar" "$SCRATCH/plain-make-args" \
+    '^EC_I2C_SOCK=$'
+expect_contains "host QEMU disables GPIO socket without sidecar" "$SCRATCH/plain-make-args" \
+    '^EC_GPIO_SOCK=$'
+expect_contains "runner gives sidecar and host the same socket pair" "$PROD" \
+    'odp_e2e_start_ec_sidecar "\$run_dir" "\$ec_i2c_sock" "\$ec_gpio_sock"'
 expect_contains "sidecar build uses existing dev-qemu platform" "$PROD" \
     'mod/ec/platform/dev-qemu'
 expect_contains "sidecar build bypasses the broken submodule HEAD dependency" "$PROD" \

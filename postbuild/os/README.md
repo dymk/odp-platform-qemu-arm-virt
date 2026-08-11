@@ -46,7 +46,8 @@ smoke/
 
 `drivers.txt` lists release asset basenames without `.zip`.
 `secure-uuid.txt` contains exactly one lowercase canonical UUID. The smoke
-crate must produce `smoke.exe`; use
+crate must explicitly declare a `[[bin]]` named `smoke`, producing
+`smoke.exe`; use
 `postbuild/os/windows-acpi-e2e/guest-support` to write the standard result,
 mirror it to COM1 when available, and shut down the guest.
 
@@ -58,9 +59,10 @@ The guest paths are fixed:
 - failure prefix: `FAIL: `
 
 An empty `needs-ec-sidecar` file selects the existing EC firmware sidecar.
-The runner builds `mod/ec/platform/dev-qemu`, starts its RISC-V QEMU, connects
-the host through the established PTY serial transport, records
-`ec-sidecar.log`, and terminates only the PID it started.
+The runner builds `mod/ec/platform/dev-qemu`, starts its RISC-V QEMU, wires
+run-local I2C/GPIO sockets into the host QEMU, connects the established PTY
+serial transport, records `ec-sidecar.log`, and terminates only the PID it
+started.
 
 Adapters normally compile
 `mod/uefi/platform/QemuArmVirtPkg/AcpiTables/ec.asl`. An optional

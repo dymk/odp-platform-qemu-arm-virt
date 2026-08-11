@@ -14,13 +14,14 @@ ODP_E2E_CARGO_XWIN_VERSION='0.23.0'
 ODP_E2E_OWNED_SIDECAR_PID=''
 
 odp_e2e_validate_adapter() {
-    local adapter="${1-}" required uuid marker entry include repo
+    local adapter="${1-}" required uuid marker entry include symlink
     local entries=()
     [ -d "$adapter" ] || return 1
     for required in smoke/Cargo.toml smoke/Cargo.lock smoke/rust-toolchain.toml \
         smoke/src/main.rs drivers.txt secure-uuid.txt; do
         [ -f "$adapter/$required" ] || return 1
     done
+    odp_e2e_validate_smoke_manifest "$adapter/smoke/Cargo.toml" || return 1
     [ -s "$adapter/drivers.txt" ] || return 1
     uuid="$(cat "$adapter/secure-uuid.txt")"
     [[ "$uuid" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] \
@@ -28,23 +29,40 @@ odp_e2e_validate_adapter() {
     marker="$adapter/needs-ec-sidecar"
     [ ! -e "$marker" ] || { [ -f "$marker" ] && [ ! -s "$marker" ]; } || return 1
     for include in acpi-entry.txt acpi-includes.txt; do
-        [ ! -e "$adapter/$include" ] || [ -f "$adapter/$include" ] || return 1
+        [ ! -e "$adapter/$include" ] \
+            || { [ -f "$adapter/$include" ] && [ ! -L "$adapter/$include" ]; } \
+            || return 1
     done
-    repo="$(odp_e2e_repo_root)"
     if [ -f "$adapter/acpi-entry.txt" ]; then
         mapfile -t entries < "$adapter/acpi-entry.txt"
         [ "${#entries[@]}" -eq 1 ] || return 1
         entry="${entries[0]}"
-        odp_e2e_validate_relative_path "$entry" \
-            && [ -f "$repo/$entry" ] || return 1
+        odp_e2e_resolve_repo_path "$entry" file >/dev/null || return 1
     fi
     if [ -f "$adapter/acpi-includes.txt" ]; then
         while IFS= read -r include; do
             [ -n "$include" ] || continue
-            odp_e2e_validate_relative_path "$include" \
-                && [ -d "$repo/$include" ] || return 1
+            include="$(odp_e2e_resolve_repo_path "$include" directory)" || return 1
+            symlink="$(find "$include" -type l -print -quit)" || return 1
+            [ -z "$symlink" ] || return 1
         done < "$adapter/acpi-includes.txt"
     fi
+}
+
+odp_e2e_validate_smoke_manifest() {
+    python3 - "$1" <<'PY'
+import sys
+import tomllib
+
+try:
+    with open(sys.argv[1], "rb") as manifest:
+        bins = tomllib.load(manifest).get("bin", [])
+except (OSError, tomllib.TOMLDecodeError):
+    sys.exit(1)
+
+sys.exit(0 if any(isinstance(binary, dict) and binary.get("name") == "smoke"
+                  for binary in bins) else 1)
+PY
 }
 
 odp_e2e_validate_relative_path() {
@@ -55,8 +73,44 @@ odp_e2e_validate_relative_path() {
     esac
 }
 
+odp_e2e_resolve_repo_path() {
+    local relative="${1-}" kind="${2-}" root lexical current component resolved
+    local components=()
+    odp_e2e_validate_relative_path "$relative" || return 1
+    root="$(realpath -e -- "$(odp_e2e_repo_root)")" || return 1
+    lexical="$(realpath -s -m -- "$root/$relative")" || return 1
+    case "$lexical" in
+        "$root"/*) ;;
+        *) return 1 ;;
+    esac
+    relative="${lexical#"$root"/}"
+    current="$root"
+    IFS='/' read -r -a components <<< "$relative"
+    for component in "${components[@]}"; do
+        current="$current/$component"
+        [ ! -L "$current" ] || return 1
+    done
+    resolved="$(realpath -e -- "$lexical")" || return 1
+    odp_e2e_path_within_repo "$resolved" "$root" || return 1
+    case "$kind" in
+        file) [ -f "$resolved" ] || return 1 ;;
+        directory) [ -d "$resolved" ] || return 1 ;;
+        *) return 1 ;;
+    esac
+    printf '%s\n' "$resolved"
+}
+
 odp_e2e_adapter_needs_ec_sidecar() {
     [ -f "$1/needs-ec-sidecar" ] && [ ! -s "$1/needs-ec-sidecar" ]
+}
+
+odp_e2e_ec_socket_paths() {
+    local run_dir="${1-}" root
+    root="${ODP_E2E_REPO_ROOT:-$(realpath -e -- "$(odp_e2e_repo_root)")}" || return 1
+    run_dir="$(realpath -m -- "$run_dir")" || return 1
+    odp_e2e_path_within_repo "$run_dir" "$root" || return 1
+    odp_e2e_host_to_container_path "$run_dir/ec-i2c.sock" "$root"
+    odp_e2e_host_to_container_path "$run_dir/ec-gpio.sock" "$root"
 }
 
 odp_e2e_validate_sources() {
@@ -871,8 +925,8 @@ odp_e2e_signal_qemu_pid() {
 }
 
 odp_e2e_start_ec_sidecar() {
-    local run_dir="$1" log pid_file binary_container log_container pid_container
-    local i2c_container gpio_container
+    local run_dir="$1" i2c_container="$2" gpio_container="$3"
+    local log pid_file binary_container log_container pid_container
     git -C "$ODP_E2E_REPO_ROOT" submodule update --init --recursive -- mod/ec \
         || return 1
     odp_e2e_dc -w mod/ec/platform/dev-qemu -- cargo build --release --locked \
@@ -884,10 +938,6 @@ odp_e2e_start_ec_sidecar() {
         "$ODP_E2E_REPO_ROOT")"
     log_container="$(odp_e2e_host_to_container_path "$log" "$ODP_E2E_REPO_ROOT")"
     pid_container="$(odp_e2e_host_to_container_path "$pid_file" "$ODP_E2E_REPO_ROOT")"
-    i2c_container="$(odp_e2e_host_to_container_path \
-        "$run_dir/ec-i2c.sock" "$ODP_E2E_REPO_ROOT")"
-    gpio_container="$(odp_e2e_host_to_container_path \
-        "$run_dir/ec-gpio.sock" "$ODP_E2E_REPO_ROOT")"
     odp_e2e_dc sh -c '
 set -eu
 setsid qemu-system-riscv32 \
@@ -937,6 +987,7 @@ odp_e2e_stop_ec_sidecar() {
 odp_e2e_boot_qemu() {
     local image="$1" target="$2" log="$3" timeout_seconds="$4" run_dir="$5"
     local ec_pty="${6-}"
+    local ec_i2c_sock="${7-}" ec_gpio_sock="${8-}"
     local image_container target_container="" tpm_container pid_container status=0 qemu_pid
     image_container="$(odp_e2e_host_to_container_path "$image" "$ODP_E2E_REPO_ROOT")"
     tpm_container="$(odp_e2e_host_to_container_path "$run_dir/swtpm/sock" "$ODP_E2E_REPO_ROOT")"
@@ -947,8 +998,8 @@ odp_e2e_boot_qemu() {
     local args=(
         -C "$ODP_E2E_REPO_ROOT/mod/uefi" run
         "PATH_TO_OS=$image_container"
-        "EC_I2C_SOCK="
-        "EC_GPIO_SOCK="
+        "EC_I2C_SOCK=$ec_i2c_sock"
+        "EC_GPIO_SOCK=$ec_gpio_sock"
         "QEMU_DISPLAY=none"
         "TPM_DEV=$tpm_container"
         "ODP_E2E_QEMU_PID_FILE=$pid_container"
@@ -1076,7 +1127,8 @@ odp_e2e_preserve_evidence() {
 odp_e2e_run_e2e() {
     local cache_dir="$1" base="$2" timeout_seconds="$3" keep="$4" adapter="$5"
     local secure_uuid="$6"
-    local run_dir overlay result ec_pty="" evidence verified=0
+    local run_dir overlay result ec_pty="" ec_i2c_sock="" ec_gpio_sock=""
+    local evidence verified=0 socket_paths=()
     run_dir="$cache_dir/runs/$(date +%Y%m%d-%H%M%S)-$$"
     overlay="$run_dir/overlay.qcow2"
     result="$run_dir/result.txt"
@@ -1086,14 +1138,19 @@ odp_e2e_run_e2e() {
         return 1
     fi
     if odp_e2e_adapter_needs_ec_sidecar "$adapter"; then
-        odp_e2e_start_ec_sidecar "$run_dir"
+        mapfile -t socket_paths < <(odp_e2e_ec_socket_paths "$run_dir")
+        [ "${#socket_paths[@]}" -eq 2 ] \
+            || { odp_e2e_warn "could not resolve EC sidecar socket paths"; return 1; }
+        ec_i2c_sock="${socket_paths[0]}"
+        ec_gpio_sock="${socket_paths[1]}"
+        odp_e2e_start_ec_sidecar "$run_dir" "$ec_i2c_sock" "$ec_gpio_sock"
         ec_pty="$(odp_e2e_discover_ec_pty "$run_dir/ec-sidecar.log")" \
             || { odp_e2e_warn "EC sidecar PTY was not reported"; return 1; }
         odp_e2e_log "EC sidecar connected through $ec_pty"
     fi
     odp_e2e_log "booting adapter smoke headlessly"
     odp_e2e_boot_qemu "$overlay" "" "$run_dir/boot.log" "$timeout_seconds" \
-        "$run_dir" "$ec_pty"
+        "$run_dir" "$ec_pty" "$ec_i2c_sock" "$ec_gpio_sock"
     if [ -n "$ODP_E2E_OWNED_SIDECAR_PID" ]; then
         odp_e2e_stop_ec_sidecar "$ODP_E2E_OWNED_SIDECAR_PID"
         ODP_E2E_OWNED_SIDECAR_PID=""
@@ -1117,7 +1174,7 @@ odp_e2e_run_e2e() {
 }
 
 odp_e2e_collect_input_files() {
-    local adapter="$1" file
+    local adapter="$1" file entry include
     printf '%s\n' \
         "$ODP_E2E_REPO_ROOT/scripts/run-windows-acpi-e2e.sh" \
         "$ODP_E2E_REPO_ROOT/scripts/qemu-ec-wrapper.sh" \
@@ -1137,6 +1194,19 @@ odp_e2e_collect_input_files() {
         printf '%s\n' "$file"
     done < <(find "$ODP_E2E_REPO_ROOT/mod/uefi/platform/QemuArmVirtPkg/AcpiTables" \
         -type f \( -name '*.asl' -o -name '*.asi' -o -name '*.inc' \) | sort)
+    if [ -f "$adapter/acpi-entry.txt" ]; then
+        entry="$(odp_e2e_resolve_repo_path "$(cat "$adapter/acpi-entry.txt")" file)" \
+            || return 1
+        printf '%s\n' "$entry"
+    fi
+    if [ -f "$adapter/acpi-includes.txt" ]; then
+        while IFS= read -r include; do
+            [ -n "$include" ] || continue
+            include="$(odp_e2e_resolve_repo_path "$include" directory)" || return 1
+            find "$include" -type f \
+                \( -name '*.asl' -o -name '*.asi' -o -name '*.inc' \) -print
+        done < "$adapter/acpi-includes.txt" | sort
+    fi
 }
 
 odp_e2e_main() {
