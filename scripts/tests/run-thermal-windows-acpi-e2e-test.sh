@@ -7,6 +7,7 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+GENERIC="$REPO_ROOT/scripts/run-windows-acpi-e2e.sh"
 ADAPTER="$REPO_ROOT/postbuild/os/windows-acpi-e2e/adapters/thermal"
 SMOKE="$ADAPTER/smoke"
 SOURCE="$SMOKE/src/main.rs"
@@ -53,13 +54,17 @@ expect_exact_file() {
     fi
 }
 
+if [ -f "$GENERIC" ]; then
+    # shellcheck source=/dev/null
+    ODP_WINDOWS_ACPI_E2E_SOURCE_ONLY=1 source "$GENERIC"
+fi
+
 echo "== thermal adapter schema =="
 for required in smoke/Cargo.toml smoke/Cargo.lock smoke/rust-toolchain.toml \
     smoke/src/main.rs drivers.txt secure-uuid.txt needs-ec-sidecar; do
     expect_pass "thermal adapter has $required" test -f "$ADAPTER/$required"
 done
-expect_pass "EC sidecar marker is empty" bash -c \
-    'test -f "$1" && test ! -s "$1"' _ "$ADAPTER/needs-ec-sidecar"
+expect_pass "generic loader accepts thermal adapter" odp_e2e_load_adapter "$ADAPTER"
 expect_exact_file "thermal service UUID is exact" "$ADAPTER/secure-uuid.txt" \
     "31f56da7-593c-4d72-a4b3-8fc7171ac073"
 expect_exact_file "thermal driver list is exact" "$ADAPTER/drivers.txt" \

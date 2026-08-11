@@ -12,10 +12,18 @@ ODP_E2E_PASS_LINE='PASS: Windows ACPI E2E'
 ODP_E2E_BUILDER_PASS_LINE='PASS: local image build'
 ODP_E2E_CARGO_XWIN_VERSION='0.23.0'
 ODP_E2E_OWNED_SIDECAR_PID=''
+ODP_E2E_ADAPTER_UUID=''
+ODP_E2E_ADAPTER_NEEDS_EC_SIDECAR=0
+ODP_E2E_ADAPTER_ACPI_ENTRY=''
+ODP_E2E_ADAPTER_DRIVER_INVENTORY=''
+ODP_E2E_ADAPTER_SMOKE_DIR=''
+ODP_E2E_ADAPTER_ACPI_INCLUDES=()
+ODP_E2E_ADAPTER_INPUT_FILES=()
 
-odp_e2e_validate_adapter() {
-    local adapter="${1-}" required uuid marker entry include symlink
-    local entries=()
+odp_e2e_load_adapter() {
+    local adapter="${1-}" required uuid marker entry include symlink root
+    local resolved_entry
+    local entries=() resolved_includes=() input_files=()
     [ -d "$adapter" ] || return 1
     for required in smoke/Cargo.toml smoke/Cargo.lock smoke/rust-toolchain.toml \
         smoke/src/main.rs drivers.txt secure-uuid.txt; do
@@ -33,20 +41,45 @@ odp_e2e_validate_adapter() {
             || { [ -f "$adapter/$include" ] && [ ! -L "$adapter/$include" ]; } \
             || return 1
     done
+    entry="mod/uefi/platform/QemuArmVirtPkg/AcpiTables/ec.asl"
     if [ -f "$adapter/acpi-entry.txt" ]; then
         mapfile -t entries < "$adapter/acpi-entry.txt"
         [ "${#entries[@]}" -eq 1 ] || return 1
         entry="${entries[0]}"
-        odp_e2e_resolve_repo_path "$entry" file >/dev/null || return 1
     fi
+    resolved_entry="$(odp_e2e_resolve_repo_path "$entry" file)" || return 1
     if [ -f "$adapter/acpi-includes.txt" ]; then
         while IFS= read -r include; do
             [ -n "$include" ] || continue
             include="$(odp_e2e_resolve_repo_path "$include" directory)" || return 1
             symlink="$(find "$include" -type l -print -quit)" || return 1
             [ -z "$symlink" ] || return 1
+            resolved_includes+=("$include")
         done < "$adapter/acpi-includes.txt"
     fi
+    root="${ODP_E2E_REPO_ROOT:-$(realpath -e -- "$(odp_e2e_repo_root)")}" || return 1
+    mapfile -t input_files < <(
+        printf '%s\n' "$adapter/drivers.txt" "$adapter/secure-uuid.txt"
+        find "$adapter/smoke" -type f ! -path '*/target/*' -print | sort
+        for include in needs-ec-sidecar acpi-entry.txt acpi-includes.txt; do
+            [ ! -f "$adapter/$include" ] || printf '%s\n' "$adapter/$include"
+        done
+        find "$root/mod/uefi/platform/QemuArmVirtPkg/AcpiTables" \
+            -type f \( -name '*.asl' -o -name '*.asi' -o -name '*.inc' \) -print | sort
+        [ ! -f "$adapter/acpi-entry.txt" ] || printf '%s\n' "$resolved_entry"
+        for include in "${resolved_includes[@]}"; do
+            find "$include" -type f \
+                \( -name '*.asl' -o -name '*.asi' -o -name '*.inc' \) -print
+        done | sort
+    )
+    ODP_E2E_ADAPTER_UUID="$uuid"
+    ODP_E2E_ADAPTER_NEEDS_EC_SIDECAR=0
+    [ ! -f "$marker" ] || ODP_E2E_ADAPTER_NEEDS_EC_SIDECAR=1
+    ODP_E2E_ADAPTER_ACPI_ENTRY="$resolved_entry"
+    ODP_E2E_ADAPTER_DRIVER_INVENTORY="$adapter/drivers.txt"
+    ODP_E2E_ADAPTER_SMOKE_DIR="$adapter/smoke"
+    ODP_E2E_ADAPTER_ACPI_INCLUDES=("${resolved_includes[@]}")
+    ODP_E2E_ADAPTER_INPUT_FILES=("${input_files[@]}")
 }
 
 odp_e2e_validate_smoke_manifest() {
@@ -100,10 +133,6 @@ odp_e2e_resolve_repo_path() {
     printf '%s\n' "$resolved"
 }
 
-odp_e2e_adapter_needs_ec_sidecar() {
-    [ -f "$1/needs-ec-sidecar" ] && [ ! -s "$1/needs-ec-sidecar" ]
-}
-
 odp_e2e_ec_socket_paths() {
     local run_dir="${1-}" root
     root="${ODP_E2E_REPO_ROOT:-$(realpath -e -- "$(odp_e2e_repo_root)")}" || return 1
@@ -111,14 +140,6 @@ odp_e2e_ec_socket_paths() {
     odp_e2e_path_within_repo "$run_dir" "$root" || return 1
     odp_e2e_host_to_container_path "$run_dir/ec-i2c.sock" "$root"
     odp_e2e_host_to_container_path "$run_dir/ec-gpio.sock" "$root"
-}
-
-odp_e2e_validate_sources() {
-    local count=0
-    [ -n "${1-}" ] && count=$((count + 1))
-    [ -n "${2-}" ] && count=$((count + 1))
-    [ -n "${3-}" ] && count=$((count + 1))
-    [ "$count" -eq 1 ]
 }
 
 odp_e2e_ensure_rust_190() {
@@ -335,27 +356,11 @@ EOF
     )
 }
 
-odp_e2e_check_builder_result() {
-    [ -f "$1" ] || return 1
-    tr -d '\r' < "$1" | grep -qxF "$ODP_E2E_BUILDER_PASS_LINE"
-}
-
-odp_e2e_check_result_file() {
-    [ -f "$1" ] || return 1
-    tr -d '\r' < "$1" | grep -qxF "$ODP_E2E_PASS_LINE"
-}
-
 odp_e2e_verify_e2e_result() {
     [ "$#" -eq 3 ] || return 2
-    odp_e2e_check_result_file "$1" && grep -qiF "$3" "$2"
-}
-
-odp_e2e_should_delete_run_dir() {
-    [ "$1" = 1 ] && [ "$2" = 0 ]
-}
-
-odp_e2e_relative_backing_path() {
-    realpath -m --relative-to="$(dirname "$1")" "$2"
+    [ -f "$1" ] \
+        && tr -d '\r' < "$1" | grep -qxF "$ODP_E2E_PASS_LINE" \
+        && grep -qiF "$3" "$2"
 }
 
 odp_e2e_path_within_repo() {
@@ -452,26 +457,6 @@ odp_e2e_repo_root() {
 odp_e2e_host_to_container_path() {
     local host_path="$1" repo_root="$2"
     printf '/workspaces/%s%s\n' "$(basename "$repo_root")" "${host_path#"$repo_root"}"
-}
-
-odp_e2e_devcontainer_git_mount() {
-    local repo common
-    repo="$(realpath -m -- "$1")" || return 1
-    common="$(realpath -m -- "$2")" || return 1
-    if odp_e2e_path_within_repo "$common" "$repo"; then
-        return 0
-    fi
-    printf 'type=bind,source=%s,target=%s\n' "$common" "$common"
-}
-
-odp_e2e_devcontainer_worktree_mount() {
-    local repo common
-    repo="$(realpath -m -- "$1")" || return 1
-    common="$(realpath -m -- "$2")" || return 1
-    if odp_e2e_path_within_repo "$common" "$repo"; then
-        return 0
-    fi
-    printf 'type=bind,source=%s,target=%s\n' "$repo" "$repo"
 }
 
 odp_e2e_dc() {
@@ -583,7 +568,7 @@ odp_e2e_ensure_devcontainer() {
     local config="$ODP_E2E_REPO_ROOT/.devcontainer/devcontainer.json"
     local dockerfile="$ODP_E2E_REPO_ROOT/.devcontainer/Dockerfile"
     local container_repo="/workspaces/$(basename "$ODP_E2E_REPO_ROOT")"
-    local common mount needs_up=0
+    local common needs_up=0
     local mount_args=()
 
     if [ ! -f "$stamp" ] || [ "$config" -nt "$stamp" ] || [ "$dockerfile" -nt "$stamp" ]; then
@@ -594,11 +579,14 @@ odp_e2e_ensure_devcontainer() {
     fi
     [ "$needs_up" = 1 ] || return 0
 
-    common="$(git -C "$ODP_E2E_REPO_ROOT" rev-parse --path-format=absolute --git-common-dir)"
-    mount="$(odp_e2e_devcontainer_git_mount "$ODP_E2E_REPO_ROOT" "$common")"
-    [ -z "$mount" ] || mount_args+=(--mount "$mount")
-    mount="$(odp_e2e_devcontainer_worktree_mount "$ODP_E2E_REPO_ROOT" "$common")"
-    [ -z "$mount" ] || mount_args+=(--mount "$mount")
+    common="$(realpath -m -- "$(git -C "$ODP_E2E_REPO_ROOT" \
+        rev-parse --path-format=absolute --git-common-dir)")"
+    if ! odp_e2e_path_within_repo "$common" "$ODP_E2E_REPO_ROOT"; then
+        mount_args+=(
+            --mount "type=bind,source=$common,target=$common"
+            --mount "type=bind,source=$ODP_E2E_REPO_ROOT,target=$ODP_E2E_REPO_ROOT"
+        )
+    fi
     devcontainer up --remove-existing-container \
         --workspace-folder "$ODP_E2E_REPO_ROOT" \
         --remote-env GIT_COMMITTER_NAME=vscode \
@@ -637,14 +625,10 @@ odp_e2e_github_curl() {
     curl --fail --location --silent --show-error "${headers[@]}" "$url"
 }
 
-odp_e2e_driver_release_url() {
-    printf 'https://api.github.com/repos/%s/releases/tags/%s\n' "$1" "$2"
-}
-
 odp_e2e_resolve_driver_assets() {
     local repo="$1" release="$2" inventory="$3" endpoint release_json
     local required=()
-    endpoint="$(odp_e2e_driver_release_url "$repo" "$release")"
+    endpoint="https://api.github.com/repos/$repo/releases/tags/$release"
     release_json="$(odp_e2e_github_curl "$endpoint")" \
         || odp_e2e_die "could not resolve driver release $repo@$release"
     mapfile -t required < <(
@@ -808,14 +792,14 @@ odp_e2e_ensure_cargo_xwin() {
 }
 
 odp_e2e_build_smoke() {
-    local cache_dir="$1" cargo_xwin="$2" adapter="$3" target_dir exe
+    local cache_dir="$1" cargo_xwin="$2" smoke_dir="$3" target_dir exe
     target_dir="$cache_dir/cargo-target/smoke"
     mkdir -p "$cache_dir/cargo-home" "$cache_dir/xwin" "$target_dir"
     odp_e2e_ensure_rust_190
     exe="$target_dir/aarch64-pc-windows-msvc/release/smoke.exe"
     rm -f "$exe"
     (
-        cd "$adapter/smoke"
+        cd "$smoke_dir"
         PATH="$(dirname "$cargo_xwin"):$PATH" \
         CARGO_HOME="$cache_dir/cargo-home" \
         CARGO_TARGET_DIR="$target_dir" \
@@ -827,10 +811,10 @@ odp_e2e_build_smoke() {
 }
 
 odp_e2e_build_acpi() {
-    local cache_dir="$1" identity="$2" adapter="$3" final stage input output
-    local entry="mod/uefi/platform/QemuArmVirtPkg/AcpiTables/ec.asl"
+    local cache_dir="$1" identity="$2" entry="$3" final stage input output
     local include_path include_container
     local includes=()
+    shift 3
     final="$cache_dir/acpi/$identity"
     if [ -s "$final/ACPITABL.dat" ]; then
         printf '%s\n' "$final/ACPITABL.dat"
@@ -839,21 +823,15 @@ odp_e2e_build_acpi() {
     stage="${final}.tmp.$$.$RANDOM"
     odp_e2e_remove_owned_tree "$stage"
     mkdir -p "$stage"
-    if [ -f "$adapter/acpi-entry.txt" ]; then
-        entry="$(cat "$adapter/acpi-entry.txt")"
-    fi
-    input="$(odp_e2e_host_to_container_path "$ODP_E2E_REPO_ROOT/$entry" \
+    input="$(odp_e2e_host_to_container_path "$entry" \
         "$ODP_E2E_REPO_ROOT")"
     output="$(odp_e2e_host_to_container_path "$stage" "$ODP_E2E_REPO_ROOT")"
     includes+=("$(dirname "$input")")
-    if [ -f "$adapter/acpi-includes.txt" ]; then
-        while IFS= read -r include_path; do
-            [ -n "$include_path" ] || continue
-            include_container="$(odp_e2e_host_to_container_path \
-                "$ODP_E2E_REPO_ROOT/$include_path" "$ODP_E2E_REPO_ROOT")"
-            includes+=("$include_container")
-        done < "$adapter/acpi-includes.txt"
-    fi
+    for include_path in "$@"; do
+        include_container="$(odp_e2e_host_to_container_path \
+            "$include_path" "$ODP_E2E_REPO_ROOT")"
+        includes+=("$include_container")
+    done
     odp_e2e_dc bash -c '
 set -e
 input=$1
@@ -875,7 +853,7 @@ cp "$output/table.aml" "$output/ACPITABL.dat"
 odp_e2e_make_overlay() {
     local overlay="$1" base="$2" format="$3" relative
     mkdir -p "$(dirname "$overlay")"
-    relative="$(odp_e2e_relative_backing_path "$overlay" "$base")"
+    relative="$(realpath -m --relative-to="$(dirname "$overlay")" "$base")"
     (
         cd "$(dirname "$overlay")"
         qemu-img create -q -f qcow2 -F "$format" -b "$relative" "$(basename "$overlay")"
@@ -907,21 +885,6 @@ odp_e2e_inject_builder_payload() {
         : upload "$ODP_E2E_REPO_ROOT/postbuild/os/windows-acpi-e2e/build-validationos.cmd" /odp-e2e-builder/build.cmd \
         : copy-in "$extracted/dism" /odp-e2e-builder \
         : copy-in "$drivers" /odp-e2e-builder
-}
-
-odp_e2e_qemu_pid_alive() {
-    [[ "$1" =~ ^[0-9]+$ ]] || return 1
-    odp_e2e_dc sh -c 'kill -0 "$1"' sh "$1"
-}
-
-odp_e2e_signal_qemu_pid() {
-    local pid="$1" signal="$2"
-    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
-    case "$signal" in
-        TERM|KILL) ;;
-        *) return 1 ;;
-    esac
-    odp_e2e_dc sh -c 'kill "-$1" "$2"' sh "$signal" "$pid"
 }
 
 odp_e2e_start_ec_sidecar() {
@@ -1010,12 +973,13 @@ odp_e2e_boot_qemu() {
         make "${args[@]}" > "$log" 2>&1 || status=$?
     if [ -f "$run_dir/qemu.pid" ]; then
         qemu_pid="$(cat "$run_dir/qemu.pid")"
-        if odp_e2e_qemu_pid_alive "$qemu_pid" 2>/dev/null; then
-            odp_e2e_signal_qemu_pid "$qemu_pid" TERM 2>/dev/null || true
+        if [[ "$qemu_pid" =~ ^[0-9]+$ ]] \
+            && odp_e2e_dc sh -c 'kill -0 "$1"' sh "$qemu_pid" 2>/dev/null; then
+            odp_e2e_dc sh -c 'kill -TERM "$1"' sh "$qemu_pid" 2>/dev/null || true
             timeout 15 "$ODP_E2E_REPO_ROOT/scripts/dc-run.sh" -- \
                 tail --pid="$qemu_pid" -f /dev/null >/dev/null 2>&1 || true
-            if odp_e2e_qemu_pid_alive "$qemu_pid" 2>/dev/null; then
-                odp_e2e_signal_qemu_pid "$qemu_pid" KILL 2>/dev/null || true
+            if odp_e2e_dc sh -c 'kill -0 "$1"' sh "$qemu_pid" 2>/dev/null; then
+                odp_e2e_dc sh -c 'kill -KILL "$1"' sh "$qemu_pid" 2>/dev/null || true
             fi
         fi
     fi
@@ -1076,7 +1040,9 @@ odp_e2e_build_local_base() {
     odp_e2e_boot_qemu "$builder" "$target" "$run_dir/builder-boot.log" \
         "$timeout_seconds" "$run_dir"
     if ! odp_e2e_extract_builder_result "$builder" "$run_dir" \
-        || ! odp_e2e_check_builder_result "$run_dir/build-result.txt" \
+        || [ ! -f "$run_dir/build-result.txt" ] \
+        || ! tr -d '\r' < "$run_dir/build-result.txt" \
+            | grep -qxF "$ODP_E2E_BUILDER_PASS_LINE" \
         || ! odp_e2e_validate_target_payload "$target"; then
         odp_e2e_warn "Windows builder did not produce a valid target; artifacts preserved at $run_dir"
         return 1
@@ -1088,10 +1054,6 @@ odp_e2e_build_local_base() {
     fi
 }
 
-odp_e2e_run_registry_path() {
-    printf '%s/smoke-shell.reg\n' "$1"
-}
-
 odp_e2e_remove_e2e_result() {
     local image="$1"
     guestfish -a "$image" run : mount /dev/sda3 / \
@@ -1100,7 +1062,7 @@ odp_e2e_remove_e2e_result() {
 
 odp_e2e_prepare_run_overlay() {
     local base="$1" overlay="$2" run_dir="$3" registry
-    registry="$(odp_e2e_run_registry_path "$run_dir")"
+    registry="$run_dir/smoke-shell.reg"
     odp_e2e_make_overlay "$overlay" "$base" qcow2
     guestfish -a "$overlay" run : ntfsfix /dev/sda3
     odp_e2e_remove_e2e_result "$overlay" || return 1
@@ -1125,7 +1087,7 @@ odp_e2e_preserve_evidence() {
 }
 
 odp_e2e_run_e2e() {
-    local cache_dir="$1" base="$2" timeout_seconds="$3" keep="$4" adapter="$5"
+    local cache_dir="$1" base="$2" timeout_seconds="$3" keep="$4" needs_sidecar="$5"
     local secure_uuid="$6"
     local run_dir overlay result ec_pty="" ec_i2c_sock="" ec_gpio_sock=""
     local evidence verified=0 socket_paths=()
@@ -1137,7 +1099,7 @@ odp_e2e_run_e2e() {
         odp_e2e_warn "run image preparation failed; artifacts preserved at $run_dir"
         return 1
     fi
-    if odp_e2e_adapter_needs_ec_sidecar "$adapter"; then
+    if [ "$needs_sidecar" = 1 ]; then
         mapfile -t socket_paths < <(odp_e2e_ec_socket_paths "$run_dir")
         [ "${#socket_paths[@]}" -eq 2 ] \
             || { odp_e2e_warn "could not resolve EC sidecar socket paths"; return 1; }
@@ -1165,7 +1127,7 @@ odp_e2e_run_e2e() {
         odp_e2e_warn "E2E verification failed; artifacts preserved at $run_dir"
         return 1
     fi
-    if odp_e2e_should_delete_run_dir "$verified" "$keep"; then
+    if [ "$keep" = 0 ]; then
         rm -rf "$run_dir"
     else
         odp_e2e_log "successful run image preserved at $run_dir"
@@ -1174,7 +1136,6 @@ odp_e2e_run_e2e() {
 }
 
 odp_e2e_collect_input_files() {
-    local adapter="$1" file entry include
     printf '%s\n' \
         "$ODP_E2E_REPO_ROOT/scripts/run-windows-acpi-e2e.sh" \
         "$ODP_E2E_REPO_ROOT/scripts/qemu-ec-wrapper.sh" \
@@ -1183,37 +1144,15 @@ odp_e2e_collect_input_files() {
         "$ODP_E2E_REPO_ROOT/postbuild/os/windows-acpi-e2e/guest-support/Cargo.toml" \
         "$ODP_E2E_REPO_ROOT/postbuild/os/windows-acpi-e2e/guest-support/Cargo.lock" \
         "$ODP_E2E_REPO_ROOT/postbuild/os/windows-acpi-e2e/guest-support/rust-toolchain.toml" \
-        "$ODP_E2E_REPO_ROOT/postbuild/os/windows-acpi-e2e/guest-support/src/lib.rs" \
-        "$adapter/drivers.txt" \
-        "$adapter/secure-uuid.txt"
-    find "$adapter/smoke" -type f ! -path '*/target/*' -print | sort
-    for file in needs-ec-sidecar acpi-entry.txt acpi-includes.txt; do
-        [ ! -f "$adapter/$file" ] || printf '%s\n' "$adapter/$file"
-    done
-    while IFS= read -r file; do
-        printf '%s\n' "$file"
-    done < <(find "$ODP_E2E_REPO_ROOT/mod/uefi/platform/QemuArmVirtPkg/AcpiTables" \
-        -type f \( -name '*.asl' -o -name '*.asi' -o -name '*.inc' \) | sort)
-    if [ -f "$adapter/acpi-entry.txt" ]; then
-        entry="$(odp_e2e_resolve_repo_path "$(cat "$adapter/acpi-entry.txt")" file)" \
-            || return 1
-        printf '%s\n' "$entry"
-    fi
-    if [ -f "$adapter/acpi-includes.txt" ]; then
-        while IFS= read -r include; do
-            [ -n "$include" ] || continue
-            include="$(odp_e2e_resolve_repo_path "$include" directory)" || return 1
-            find "$include" -type f \
-                \( -name '*.asl' -o -name '*.asi' -o -name '*.inc' \) -print
-        done < "$adapter/acpi-includes.txt" | sort
-    fi
+        "$ODP_E2E_REPO_ROOT/postbuild/os/windows-acpi-e2e/guest-support/src/lib.rs"
+    printf '%s\n' "${ODP_E2E_ADAPTER_INPUT_FILES[@]}"
 }
 
 odp_e2e_main() {
     local adapter="" validation_os_url="" validation_os_iso="" image_path="" os_build=""
     local cache_dir="" drivers_repo="OpenDevicePartnership/odp-windows-drivers"
     local drivers_release="latest"
-    local force=0 builder_timeout=900 boot_timeout=900 keep=0
+    local force=0 builder_timeout=900 boot_timeout=900 keep=0 source_count=0
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --adapter) [ "$#" -ge 2 ] || odp_e2e_die "$1 requires a value"; adapter="$2"; shift 2 ;;
@@ -1233,7 +1172,10 @@ odp_e2e_main() {
         esac
     done
 
-    odp_e2e_validate_sources "$validation_os_url" "$validation_os_iso" "$image_path" \
+    [ -z "$validation_os_url" ] || source_count=$((source_count + 1))
+    [ -z "$validation_os_iso" ] || source_count=$((source_count + 1))
+    [ -z "$image_path" ] || source_count=$((source_count + 1))
+    [ "$source_count" -eq 1 ] \
         || odp_e2e_die "specify exactly one of --validation-os-url, --validation-os-iso, or --image"
     odp_e2e_validate_os_build "$os_build" \
         || odp_e2e_die "--validation-os-build must be an integer >= $ODP_E2E_MIN_BUILD; build 26100 lacks ACPI FF-A"
@@ -1248,7 +1190,7 @@ odp_e2e_main() {
 
     ODP_E2E_REPO_ROOT="$(realpath -e -- "$(odp_e2e_repo_root)")"
     adapter="$(realpath -e -- "$adapter")" || odp_e2e_die "--adapter directory not found"
-    odp_e2e_validate_adapter "$adapter" || odp_e2e_die "invalid adapter directory"
+    odp_e2e_load_adapter "$adapter" || odp_e2e_die "invalid adapter directory"
     [ -n "$cache_dir" ] \
         || cache_dir="$ODP_E2E_REPO_ROOT/postbuild/os/build/windows-acpi-e2e-cache"
     cache_dir="$(realpath -m -- "$cache_dir")"
@@ -1267,7 +1209,7 @@ odp_e2e_main() {
     odp_e2e_ensure_firmware "$cache_dir" "$firmware_identity" "$force"
 
     local input_files=() input_hash source_identity driver_identity key base
-    mapfile -t input_files < <(odp_e2e_collect_input_files "$adapter")
+    mapfile -t input_files < <(odp_e2e_collect_input_files)
     input_hash="$(odp_e2e_hash_inputs "${input_files[@]}")"
 
     if [ -n "$image_path" ]; then
@@ -1294,12 +1236,14 @@ odp_e2e_main() {
             || odp_e2e_die "ValidationOS ISO is empty or unreadable"
         extracted="$(odp_e2e_extract_validation_os "$cache_dir" "$iso" "$iso_identity")"
         manifest="$(odp_e2e_resolve_driver_assets "$drivers_repo" "$drivers_release" \
-            "$adapter/drivers.txt")"
+            "$ODP_E2E_ADAPTER_DRIVER_INVENTORY")"
         driver_identity="$(odp_e2e_driver_asset_identity "$manifest")"
         drivers="$(odp_e2e_prepare_drivers "$cache_dir" "$drivers_repo" "$manifest")"
         cargo_xwin="$(odp_e2e_ensure_cargo_xwin "$cache_dir")"
-        smoke="$(odp_e2e_build_smoke "$cache_dir" "$cargo_xwin" "$adapter")"
-        acpi="$(odp_e2e_build_acpi "$cache_dir" "$input_hash" "$adapter")"
+        smoke="$(odp_e2e_build_smoke "$cache_dir" "$cargo_xwin" \
+            "$ODP_E2E_ADAPTER_SMOKE_DIR")"
+        acpi="$(odp_e2e_build_acpi "$cache_dir" "$input_hash" \
+            "$ODP_E2E_ADAPTER_ACPI_ENTRY" "${ODP_E2E_ADAPTER_ACPI_INCLUDES[@]}")"
         source_identity="iso:$iso_identity"
         key="$(odp_e2e_compute_image_cache_key "$source_identity" "$os_build" \
             "$driver_identity" "$input_hash" "$firmware_identity")"
@@ -1312,8 +1256,8 @@ odp_e2e_main() {
     fi
 
     odp_e2e_log "pristine base: $base"
-    odp_e2e_run_e2e "$cache_dir" "$base" "$boot_timeout" "$keep" "$adapter" \
-        "$(cat "$adapter/secure-uuid.txt")" \
+    odp_e2e_run_e2e "$cache_dir" "$base" "$boot_timeout" "$keep" \
+        "$ODP_E2E_ADAPTER_NEEDS_EC_SIDECAR" "$ODP_E2E_ADAPTER_UUID" \
         || odp_e2e_die "Windows ACPI E2E failed"
 }
 
