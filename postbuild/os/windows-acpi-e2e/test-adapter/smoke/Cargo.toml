@@ -1,0 +1,11 @@
+[package]
+name = "windows-acpi-e2e-fixture-smoke"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.90"
+
+[dependencies]
+windows-acpi-e2e-guest-support = { path = "../../guest-support" }
+
+[workspace]
