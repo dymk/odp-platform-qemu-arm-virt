@@ -50,6 +50,19 @@ QEMU_DISPLAY="${QEMU_DISPLAY:-}"
 # devcontainer forwards.
 QEMU_VNC="${QEMU_VNC:-127.0.0.1:0}"
 
+if [ "${ODP_E2E_BUILDER_TARGET+x}" = x ] && [ -z "$ODP_E2E_BUILDER_TARGET" ]; then
+    echo "qemu-ec-wrapper: ODP_E2E_BUILDER_TARGET must not be empty" >&2
+    exit 2
+fi
+if [ "${ODP_E2E_QEMU_PID_FILE+x}" = x ] && [ -z "$ODP_E2E_QEMU_PID_FILE" ]; then
+    echo "qemu-ec-wrapper: ODP_E2E_QEMU_PID_FILE must not be empty" >&2
+    exit 2
+fi
+if [ "${ODP_E2E_EC_PTY+x}" = x ] && [ -z "$ODP_E2E_EC_PTY" ]; then
+    echo "qemu-ec-wrapper: ODP_E2E_EC_PTY must not be empty" >&2
+    exit 2
+fi
+
 # Version/help probes must not get extra device args appended.
 for arg in "$@"; do
     case "$arg" in
@@ -74,5 +87,23 @@ case "$QEMU_DISPLAY" in
     "")  : ;;
     *)   extra+=(-display "$QEMU_DISPLAY") ;;
 esac
+
+if [ "${ODP_E2E_BUILDER_TARGET+x}" = x ]; then
+    extra+=(
+        -drive "if=none,id=odp-e2e-builder-target,file=${ODP_E2E_BUILDER_TARGET},format=qcow2"
+        -device "nvme,drive=odp-e2e-builder-target,serial=ODPTARGET001"
+    )
+fi
+
+if [ "${ODP_E2E_EC_PTY+x}" = x ]; then
+    extra+=(
+        -chardev "serial,id=odp-e2e-ec-link,path=${ODP_E2E_EC_PTY}"
+        -serial "chardev:odp-e2e-ec-link"
+    )
+fi
+
+if [ "${ODP_E2E_QEMU_PID_FILE+x}" = x ]; then
+    printf '%s\n' "$$" > "$ODP_E2E_QEMU_PID_FILE"
+fi
 
 exec "$REAL_QEMU" "$@" "${extra[@]}"
