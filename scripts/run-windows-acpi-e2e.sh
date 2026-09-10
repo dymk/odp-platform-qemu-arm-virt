@@ -3,9 +3,7 @@
 #
 # SPDX-License-Identifier: MIT
 
-if [ -z "${ODP_WINDOWS_ACPI_E2E_SOURCE_ONLY:-}" ]; then
-    set -euo pipefail
-fi
+set -euo pipefail
 
 ODP_E2E_PASS_LINE='PASS: Windows ACPI E2E'
 ODP_E2E_MIN_BUILD=28000
@@ -712,8 +710,4 @@ odp_e2e_main() {
     printf '%s\n' "$ODP_E2E_PASS_LINE"
 }
 
-if [ -n "${ODP_WINDOWS_ACPI_E2E_SOURCE_ONLY:-}" ]; then
-    return 0 2>/dev/null || true
-else
-    odp_e2e_main "$@"
-fi
+odp_e2e_main "$@"

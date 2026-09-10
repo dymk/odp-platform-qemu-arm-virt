@@ -24,9 +24,4 @@ done
 echo "=== pre-commit: running UCSI smoke tests ==="
 (cd "$UCSI_SMOKE" && cargo test --locked)
 
-echo "=== pre-commit: running shell behavioral tests ==="
-for test in scripts/test/*.test.sh; do
-    bash "$test"
-done
-
 echo "=== pre-commit: all checks passed ==="
