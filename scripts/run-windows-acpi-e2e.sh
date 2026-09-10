@@ -304,7 +304,7 @@ odp_e2e_build_ucsi_smoke() {
     executable="$target/aarch64-pc-windows-msvc/release/smoke.exe"
     odp_e2e_verify_arm64_pe "$executable" "$run_dir/smoke-pe.txt" || return 1
     llvm-readobj --coff-imports "$executable" > "$run_dir/smoke-imports.txt" 2>&1 || {
-        odp_e2e_error "cannot inspect UCSI smoke imports (details: $run_dir/smoke-imports.txt)"
+        odp_e2e_error "cannot inspect UCSI smoke imports (details: $(odp_e2e_host_path "$run_dir/smoke-imports.txt"))"
         return 1
     }
     if grep -qiE '^[[:space:]]*Name: VCRUNTIME140[.]dll[[:space:]]*$' "$run_dir/smoke-imports.txt"; then
