@@ -6,7 +6,8 @@
 
 set -e
 
-PROJECTS="e2e-tests mod/secure-services/platform"
+UCSI_SMOKE="postbuild/os/windows-acpi-e2e/adapters/ucsi/smoke"
+PROJECTS="e2e-tests mod/secure-services/platform $UCSI_SMOKE"
 
 echo "=== pre-commit: checking Rust formatting ==="
 for proj in $PROJECTS; do
@@ -18,6 +19,14 @@ echo "=== pre-commit: running clippy ==="
 for proj in $PROJECTS; do
     echo "  -> $proj"
     (cd "$proj" && cargo clippy --locked -- -D warnings)
+done
+
+echo "=== pre-commit: running UCSI smoke tests ==="
+(cd "$UCSI_SMOKE" && cargo test --locked)
+
+echo "=== pre-commit: running shell behavioral tests ==="
+for test in scripts/test/*.test.sh; do
+    bash "$test"
 done
 
 echo "=== pre-commit: all checks passed ==="
