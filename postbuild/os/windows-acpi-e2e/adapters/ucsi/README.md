@@ -45,11 +45,19 @@ cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
 ```
 
-Build the ARM64 Windows executable inside the configured devcontainer, which
-provides `cargo-xwin` 0.23.0 and the Windows target:
+From the same smoke crate directory, build the ARM64 Windows executable inside
+the configured devcontainer, which provides `cargo-xwin` 0.23.0 and the Windows
+target:
 
 ```sh
 cargo xwin build --locked --release --target aarch64-pc-windows-msvc
 ```
 
 The output is `target/aarch64-pc-windows-msvc/release/smoke.exe`.
+
+The crate's `.cargo/config.toml` sets `target-feature=+crt-static` so the executable
+does not require `VCRUNTIME140.dll`, which is absent from ValidationOS. Cargo
+discovers this configuration from its working directory; passing only
+`--manifest-path` from the repository root does not load it. Run ARM64 builds
+from the smoke crate directory and inspect the result with
+`llvm-readobj --coff-imports`: it must not import `VCRUNTIME140.dll`.

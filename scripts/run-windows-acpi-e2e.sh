@@ -305,6 +305,14 @@ odp_e2e_build_ucsi_smoke() {
             2>> "$run_dir/smoke-build.log" | jq -er '.target_directory')" || return 1
     executable="$target/aarch64-pc-windows-msvc/release/smoke.exe"
     odp_e2e_verify_arm64_pe "$executable" "$run_dir/smoke-pe.txt" || return 1
+    llvm-readobj --coff-imports "$executable" > "$run_dir/smoke-imports.txt" 2>&1 || {
+        odp_e2e_error "cannot inspect UCSI smoke imports (details: $run_dir/smoke-imports.txt)"
+        return 1
+    }
+    if grep -qiE '^[[:space:]]*Name: VCRUNTIME140[.]dll[[:space:]]*$' "$run_dir/smoke-imports.txt"; then
+        odp_e2e_error "UCSI smoke imports VCRUNTIME140.dll, unavailable in WinVOS; build with crt-static"
+        return 1
+    fi
     cp "$executable" "$run_dir/smoke.exe" || return 1
     (cd "$run_dir" && sha256sum smoke.exe > smoke.exe.sha256) || return 1
     printf '%s\n' "$run_dir/smoke.exe"
@@ -467,7 +475,7 @@ odp_e2e_finish_run() {
     for file in result.txt thermal.log ucsi.log boot.log ec.log ec-qemu-stdout.log \
         ec-qemu-stderr.log qemu-status.txt firmware-build.log acpi-build.log \
         release.json secure-partition-manifest.dts secure_mm.log serial0.log \
-        smoke-build.log smoke-pe.txt smoke.exe smoke.exe.sha256 \
+        smoke-build.log smoke-pe.txt smoke-imports.txt smoke.exe smoke.exe.sha256 \
         base-image.txt image-validation.txt driver-store.txt driver-inventory.txt \
         qemu-command.txt; do
         [ ! -f "$run_dir/$file" ] || cp "$run_dir/$file" "$evidence/$file" || return 1

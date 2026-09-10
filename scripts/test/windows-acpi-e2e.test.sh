@@ -180,6 +180,7 @@ EOF
     export SPY_DIR
     : > "$WORK_DIR/guestfish.calls"
     : > "$WORK_DIR/cargo.calls"
+    : > "$WORK_DIR/cargo.cwd"
     rm -f "$WORK_DIR/qemu.args" "$WORK_DIR/qemu.env" \
         "$WORK_DIR/ec-started" "$WORK_DIR/ec-pty" "$ODP_E2E_REPO_ROOT/builds"
     DRIVER_STORE_LIST=$'pl061gpio.inf_arm64_1111\nqemui2c.inf_arm64_2222\nectest.inf_arm64_3333\nhidtime.inf_arm64_4444'
@@ -218,6 +219,7 @@ EOF
     }
     cargo() {
         printf '%s\n' "$*" >> "$WORK_DIR/cargo.calls"
+        printf '%s:%s\n' "$1" "$PWD" >> "$WORK_DIR/cargo.cwd"
         case "$1" in
             xwin)
                 echo "building current smoke"
@@ -231,10 +233,17 @@ EOF
         esac
     }
     llvm-readobj() {
-        [ "$1" = --file-headers ] || return 1
-        printf 'Format: COFF-%s\n  Machine: IMAGE_FILE_MACHINE_%s (0xAA64)\n' \
-            "$(cat "$2")" "$(cat "$2")"
-        printf 'ImageOptionalHeader {\n}\n'
+        case "$1" in
+            --file-headers)
+                printf 'Format: COFF-%s\n  Machine: IMAGE_FILE_MACHINE_%s (0xAA64)\n' \
+                    "$(cat "$2")" "$(cat "$2")"
+                printf 'ImageOptionalHeader {\n}\n'
+                ;;
+            --coff-imports)
+                printf 'Import {\n  Name: %s\n}\n' "${SMOKE_IMPORT:-KERNEL32.dll}"
+                ;;
+            *) return 1 ;;
+        esac
     }
     start_ec_qemu() {
         : > "$WORK_DIR/ec-started"
@@ -316,6 +325,25 @@ bad_smoke_binary() {
     [ ! -f "$WORK_DIR/qemu.args" ] && grep -q AMD64 "$RUN_DIR/smoke-pe.txt"
 }
 expect "non-ARM64 smoke cannot launch" 0 bad_smoke_binary
+
+smoke_build_cwd() {
+    execution_fixture ucsi || return 1
+    cd "$ODP_E2E_REPO_ROOT" || return 1
+    odp_e2e_build_ucsi_smoke "$RUN_DIR" >/dev/null || return 1
+    local crate="$ODP_E2E_PAYLOAD_DIR/adapters/ucsi/smoke"
+    [ "$(cat "$WORK_DIR/cargo.cwd")" = "xwin:$crate"$'\n'"metadata:$crate" ]
+}
+expect "smoke build and metadata run from crate CWD for Cargo config and toolchain" 0 smoke_build_cwd
+
+dynamic_crt_smoke() {
+    execution_fixture ucsi || return 1
+    SMOKE_IMPORT=VCRUNTIME140.dll
+    execute_fixture && return 1
+    [ ! -f "$WORK_DIR/qemu.args" ] \
+        && ! grep -q '/odp-e2e/smoke.exe' "$WORK_DIR/guestfish.calls" \
+        && grep -q VCRUNTIME140.dll "$RUN_DIR/smoke-imports.txt"
+}
+expect "smoke importing unavailable VCRUNTIME140.dll cannot launch" 0 dynamic_crt_smoke
 
 failed_smoke_build() {
     execution_fixture ucsi || return 1
@@ -423,6 +451,7 @@ retain_artifacts() {
     odp_e2e_finish_run "$RUN_DIR" "$evidence" "$outcome" || return 1
     [ -f "$evidence/ucsi/ucsi.log" ] && [ -f "$evidence/ucsi/smoke-build.log" ] \
         && [ -f "$evidence/ucsi/smoke.exe.sha256" ] \
+        && [ -f "$evidence/ucsi/smoke-imports.txt" ] \
         && [ -f "$evidence/ucsi/driver-inventory.txt" ] \
         && [ -f "$evidence/ucsi/qemu-command.txt" ] \
         && cmp "$WORK_DIR/runtime.log" "$evidence/ucsi/serial0.log" \
