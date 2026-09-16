@@ -131,17 +131,16 @@ image/build/overlay/QEMU/evidence infrastructure, not a fourth runnable adapter.
 
 Use the same `WINDOWS_ACPI_E2E_REPO` / `WINDOWS_ACPI_E2E_RELEASE` inputs, or
 `WINDOWS_ACPI_E2E_BASE_IMAGE=path/to/prepared.vhdx` for an already prepared,
-repo-local image. Without an explicit prepared image, the first service that
-resolves and validates a base pins that exact local VHDX for later services,
-even if that service subsequently fails. A service blocked before selecting a
-base leaves the next service free to establish the pin; once pinned, the suite
-does not resolve the rolling release again. It reads the runner's existing
-`base-image.txt`, maps its host path back into the container, and accepts only
-one absolute, regular, non-symlink `.vhdx` path inside the repository/cache.
-Invalid or conflicting records, or missing records after a runnable
-qualification, make the aggregate nonzero and leave remaining services
-`BLOCKED` rather than risk qualifying different bases. Explicit prepared-image
-inputs continue to be passed unchanged to every runner.
+repo-local image. For either input, the first valid `base-image.txt` pins the
+canonical local VHDX path and image SHA-256, even if that service subsequently
+fails. A service blocked before selecting a base leaves the next service free
+to establish the pin; later runners receive the pinned path without resolving
+the release again. The suite validates every existing run/evidence record,
+requiring one host-mapped, regular, non-symlink repo-local `.vhdx` path and one
+image SHA-256 matching its bytes. It rechecks file safety and the pinned SHA-256
+before each later service. Invalid, conflicting, or changed bases, or missing
+records after `PASS`/`FAIL`, make the aggregate nonzero and leave remaining
+services `BLOCKED`.
 
 The immutable `.e2e/assets`, `.e2e/bases`, and `.e2e/validated` caches and normal
 incremental Make/Cargo artifacts are reused; each service still gets a fresh
@@ -156,19 +155,24 @@ service	status	exit_code	evidence
 ```
 
 Evidence paths are repository-relative. `PASS` means the individual runner
-exited zero. `FAIL` means a nonzero exit with current `result.txt` or
+exited zero and per-service evidence/host-log retention succeeded. `FAIL` means
+a nonzero exit with current `result.txt` or
 `qemu-status.txt` evidence, including QEMU timeout/run failures without guest
 results. `BLOCKED` means setup, build, or image compatibility prevented that
-run evidence. The aggregate exits zero only when all three pass; it does not
-reinterpret the runner's payload assertions.
+run evidence, or retention failed after a zero runner exit (reported as exit
+code 1). Retention failures make the aggregate nonzero while preserving an
+existing `FAIL`/`BLOCKED` status and its original exit code. The aggregate exits
+zero only when all three pass; it does not reinterpret the runner's payload
+assertions.
 
 Each row retains the runner's evidence at `.e2e/evidence/<run-id>/`, with
 `host.log` copied from the independent `suite-<id>/<service>-host.log`, including
 preflight failures. `source.txt` records the suite's commit/worktree status;
-`image-input.txt` records the requested image input separately from the matrix.
-For release-based suites, it also records `pinned-service`, the container-local
-`pinned-base`, and the first selected base's `base-image.txt` contents, preserving
-the original release digest even though later runners receive a local image.
+`image-input.txt` preserves the original prepared-image or repository/release
+request separately from the matrix. For either input, it appends `pinned-service`,
+the container-local `pinned-base`, `pinned-image-sha256`, and the first valid
+`base-image.txt` contents, preserving the original release asset digest even
+though later runners receive a local image.
 Per-service `base-image.txt` and `image-validation.txt` still retain each run's
 verified digest, image SHA-256, and observed Windows build.
 

@@ -7,21 +7,39 @@ set -euo pipefail
 
 die() { printf '[windows-acpi-e2e-suite] ERROR: %s\n' "$*" >&2; exit 1; }
 
-read_base_image() {
-    local record="$1" base LC_ALL=C
-    [ -f "$record" ] && [ ! -L "$record" ] \
-        && [ "$(realpath -e -- "$record")" = "$record" ] || return 1
-    base="$(grep '^base=' "$record")" || return 1
-    # Multiple records leave an embedded newline; paths cannot contain controls.
+hash_base_image() {
+    local base="$1" canonical digest LC_ALL=C
     [[ "$base" != *[[:cntrl:]]* ]] || return 1
     case "$base" in
-        "base=$host_root/"*.vhdx)
-            base="$repo_root/${base#"base=$host_root/"}" ;;
+        "$repo_root/"*.vhdx) ;;
         *) return 1 ;;
     esac
-    [ -f "$base" ] && [ ! -L "$base" ] \
-        && [ "$(realpath -e -- "$base")" = "$base" ] || return 1
-    printf '%s\n' "$base"
+    [ -f "$base" ] && [ ! -L "$base" ] || return 1
+    canonical="$(realpath -e -- "$base")" || return 1
+    [ "$canonical" = "$base" ] || return 1
+    digest="$(sha256sum < "$base")" || return 1
+    printf '%s\n' "${digest%% *}"
+}
+
+read_base_image() {
+    local record="$1" canonical field count digest
+    [ -f "$record" ] && [ ! -L "$record" ] || return 1
+    canonical="$(realpath -e -- "$record")" || return 1
+    [ "$canonical" = "$record" ] || return 1
+    for field in base image-sha256; do
+        count="$(LC_ALL=C grep -ac "^$field=" "$record")" || return 1
+        [ "$count" = 1 ] || return 1
+    done
+    record_base="$(LC_ALL=C grep -ax 'base=[^[:cntrl:]]*' "$record")" || return 1
+    record_image_sha256="$(LC_ALL=C grep -axE 'image-sha256=[0-9a-f]{64}' "$record")" || return 1
+    record_image_sha256="${record_image_sha256#image-sha256=}"
+    case "$record_base" in
+        "base=$host_root/"*.vhdx)
+            record_base="$repo_root/${record_base#"base=$host_root/"}" ;;
+        *) return 1 ;;
+    esac
+    digest="$(hash_base_image "$record_base")" || return 1
+    [ "$digest" = "$record_image_sha256" ]
 }
 
 [ "$#" -eq 0 ] || die "this suite takes no arguments; use make variables"
@@ -60,6 +78,7 @@ printf 'service\tstatus\texit_code\tevidence\n' > "$summary"
 
 failed=0
 pinned_base=
+pinned_image_sha256=
 pin_error=
 for service in thermal ucsi battery; do
     while :; do
@@ -70,8 +89,15 @@ for service in thermal ucsi battery; do
             || [ -e "$evidence" ] || [ -L "$evidence" ] || break
     done
     host_log="$suite_dir/$service-host.log"
+    if [ -z "$pin_error" ] && [ -n "$pinned_base" ]; then
+        if ! digest="$(hash_base_image "$pinned_base")" \
+            || [ "$digest" != "$pinned_image_sha256" ]; then
+            pin_error="pinned base image changed or is unsafe: $pinned_base"
+        fi
+    fi
     if [ -n "$pin_error" ]; then
-        printf '[windows-acpi-e2e-suite] ERROR: %s\n' "$pin_error" > "$host_log"
+        printf '[windows-acpi-e2e-suite] ERROR: %s\n' "$pin_error" \
+            | tee "$host_log" >&2 || failed=1
         status=BLOCKED
         exit_code=1
     elif WINDOWS_ACPI_E2E_SERVICE="$service" \
@@ -89,18 +115,24 @@ for service in thermal ucsi battery; do
             status=FAIL
         fi
     fi
-    if [ -z "${WINDOWS_ACPI_E2E_BASE_IMAGE:-}" ] && [ -z "$pin_error" ]; then
-        record="$run_dir/base-image.txt"
-        if [ ! -e "$record" ] && [ ! -L "$record" ]; then
-            record="$evidence/base-image.txt"
-        fi
-        if [ -e "$record" ] || [ -L "$record" ]; then
-            if base="$(read_base_image "$record")" \
-                && { [ -z "$pinned_base" ] || [ "$base" = "$pinned_base" ]; }; then
+    if [ -z "$pin_error" ]; then
+        found_record=0
+        for record in "$run_dir/base-image.txt" "$evidence/base-image.txt"; do
+            if [ ! -e "$record" ] && [ ! -L "$record" ]; then
+                continue
+            fi
+            found_record=1
+            if read_base_image "$record" \
+                && { [ -z "$pinned_base" ] || {
+                    [ "$record_base" = "$pinned_base" ] \
+                        && [ "$record_image_sha256" = "$pinned_image_sha256" ];
+                }; }; then
                 if [ -z "$pinned_base" ]; then
-                    pinned_base="$base"
+                    pinned_base="$record_base"
+                    pinned_image_sha256="$record_image_sha256"
                     if ! {
-                        printf 'pinned-service=%s\npinned-base=%s\n' "$service" "$pinned_base" \
+                        printf 'pinned-service=%s\npinned-base=%s\npinned-image-sha256=%s\n' \
+                            "$service" "$pinned_base" "$pinned_image_sha256" \
                             && cat "$record"
                     } >> "$suite_dir/image-input.txt"; then
                         pin_error="cannot retain suite base image evidence"
@@ -109,21 +141,33 @@ for service in thermal ucsi battery; do
             else
                 pin_error="invalid or inconsistent base image record: $record"
             fi
-        elif [ "$status" != BLOCKED ]; then
+        done
+        if [ "$found_record" = 0 ] && [ "$status" != BLOCKED ]; then
             pin_error="missing base image record after $service $status"
         fi
         if [ -n "$pin_error" ]; then
             printf '[windows-acpi-e2e-suite] ERROR: %s\n' "$pin_error" \
-                | tee -a "$host_log" >&2
+                | tee -a "$host_log" >&2 || failed=1
             failed=1
         fi
     fi
     # Preflight may exit before the runner creates its evidence directory.
+    retention_error=
     if [ ! -L "$evidence" ] && mkdir -p "$evidence"; then
-        cp "$host_log" "$evidence/host.log" \
-            || printf 'Cannot copy host log to %s\n' "$evidence" >&2
+        if ! cp "$host_log" "$evidence/host.log"; then
+            retention_error="Cannot copy host log to $evidence"
+        fi
     else
-        printf 'Cannot retain per-service evidence at %s\n' "$evidence" >&2
+        retention_error="Cannot retain per-service evidence at $evidence"
+    fi
+    if [ -n "$retention_error" ]; then
+        failed=1
+        if [ "$status" = PASS ]; then
+            status=BLOCKED
+            exit_code=1
+        fi
+        printf '[windows-acpi-e2e-suite] ERROR: %s\n' "$retention_error" \
+            | tee -a "$host_log" >&2 || failed=1
     fi
     [ "$status" = PASS ] || failed=1
     printf '%s\t%s\t%s\t%s\n' "$service" "$status" "$exit_code" \
