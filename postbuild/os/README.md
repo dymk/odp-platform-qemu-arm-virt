@@ -116,3 +116,70 @@ Pull-request CI runs all three services against the VHDX produced by the
 workflow's Windows build job. `WINDOWS_ACPI_E2E_BASE_IMAGE` selects that
 repo-local artifact instead of downloading the rolling release; all build,
 overlay, boot, verification, and evidence logic remains shared.
+
+### Aggregate qualification
+
+```sh
+make windows-acpi-e2e-all
+```
+
+This initializes/provisions and enters the devcontainer once, then invokes the
+existing runner in fixed **thermal, ucsi, battery** order, always continuing
+after failures. It ignores the service selection for the matrix; individual
+commands above and the CI matrix remain unchanged. Issue #148 is the shared
+image/build/overlay/QEMU/evidence infrastructure, not a fourth runnable adapter.
+
+Use the same `WINDOWS_ACPI_E2E_REPO` / `WINDOWS_ACPI_E2E_RELEASE` inputs, or
+`WINDOWS_ACPI_E2E_BASE_IMAGE=path/to/prepared.vhdx` for an already prepared,
+repo-local image. For either input, the first valid `base-image.txt` pins the
+canonical local VHDX path and image SHA-256, even if that service subsequently
+fails. A service blocked before selecting a base leaves the next service free
+to establish the pin; later runners receive the pinned path without resolving
+the release again. The suite validates every existing run/evidence record,
+requiring one host-mapped, regular, non-symlink repo-local `.vhdx` path and one
+image SHA-256 matching its bytes. It rechecks file safety and the pinned SHA-256
+before each later service. Invalid, conflicting, or changed bases, or missing
+records after `PASS`/`FAIL`, make the aggregate nonzero and leave remaining
+services `BLOCKED`.
+
+The immutable `.e2e/assets`, `.e2e/bases`, and `.e2e/validated` caches and normal
+incremental Make/Cargo artifacts are reused; each service still gets a fresh
+overlay and evidence. `WINDOWS_ACPI_E2E_CACHE_DIR` can select another
+non-symlinked, repo-local cache (use a relative path across the container boundary).
+
+The suite prints and persists `summary.tsv` under a unique
+`.e2e/evidence/suite-<id>/` directory, with tab-separated columns:
+
+```text
+service	status	exit_code	evidence
+```
+
+Evidence paths are repository-relative. `PASS` means the individual runner
+exited zero and per-service evidence/host-log retention succeeded. `FAIL` means
+a nonzero exit with current `result.txt` or
+`qemu-status.txt` evidence, including QEMU timeout/run failures without guest
+results. `BLOCKED` means setup, build, or image compatibility prevented that
+run evidence, or retention failed after a zero runner exit (reported as exit
+code 1). Retention failures make the aggregate nonzero while preserving an
+existing `FAIL`/`BLOCKED` status and its original exit code. The aggregate exits
+zero only when all three pass; it does not reinterpret the runner's payload
+assertions.
+
+Each row retains the runner's evidence at `.e2e/evidence/<run-id>/`, with
+`host.log` copied from the independent `suite-<id>/<service>-host.log`, including
+preflight failures. `source.txt` records the suite's commit/worktree status;
+`image-input.txt` preserves the original prepared-image or repository/release
+request separately from the matrix. For either input, it appends `pinned-service`,
+the container-local `pinned-base`, `pinned-image-sha256`, and the first valid
+`base-image.txt` contents, preserving the original release asset digest even
+though later runners receive a local image.
+Per-service `base-image.txt` and `image-validation.txt` still retain each run's
+verified digest, image SHA-256, and observed Windows build.
+
+Individual runs optionally accept `WINDOWS_ACPI_E2E_RUN_ID` containing only
+ASCII letters, digits, underscores, and hyphens. Evidence is deterministically
+located at `<cache>/evidence/<run-id>/`. Existing run or evidence paths,
+including dangling symlinks and completed successful runs, are rejected;
+evidence-directory creation atomically reserves the identity. An omitted or
+empty ID keeps the timestamp/PID default. The suite generates its own short,
+unique IDs, ignoring any inherited run ID.

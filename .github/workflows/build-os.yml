@@ -36,6 +36,7 @@ on:
       - 'scripts/lib/ec-qemu.sh'
       - 'scripts/qemu-ec-wrapper.sh'
       - 'scripts/run-windows-acpi-e2e.sh'
+      - 'scripts/run-windows-acpi-e2e-suite.sh'
   push:
     branches: [main]
     paths:
