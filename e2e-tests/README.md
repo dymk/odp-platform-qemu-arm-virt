@@ -36,3 +36,9 @@ make e2e-test
 
 This builds the UEFI test applications, launches QEMU with the platform
 firmware, and verifies test results from the captured serial output.
+
+For TimeAlarm alone, run `make ec uefi` followed by
+`make -C e2e-tests relay-run-time-alarm`. This exercises clock set/readback,
+timer countdown, AC/DC expired-status clearing, and policy set/readback
+through the SP and EC relay. It does not qualify physical wake, power-source
+switching, ASL, or asynchronous notifications.
