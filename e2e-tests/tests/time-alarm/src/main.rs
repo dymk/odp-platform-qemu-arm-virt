@@ -423,7 +423,7 @@ fn test_policy_round_trip(ctx: &mut E2eContext, name: &str) -> Option<()> {
             TimeAlarmCommand::SetExpiredTimerPolicy,
             &timer_args(other, 45),
         )?;
-        for policy in [45, 0, u32::MAX] {
+        for policy in [45, 0] {
             set(
                 ctx,
                 name,
@@ -449,6 +449,25 @@ fn test_policy_round_trip(ctx: &mut E2eContext, name: &str) -> Option<()> {
                 "policy readback or other timer's policy changed unexpectedly",
             )?;
         }
+        // NEVER readback is indistinguishable from the getter's error sentinel.
+        set(
+            ctx,
+            name,
+            TimeAlarmCommand::SetExpiredTimerPolicy,
+            &timer_args(timer, u32::MAX),
+        )?;
+        let unchanged = scalar(
+            ctx,
+            name,
+            TimeAlarmCommand::GetExpiredTimerPolicy,
+            &other.to_le_bytes(),
+        )?;
+        require(
+            ctx,
+            name,
+            unchanged == 45,
+            "setting NEVER changed the other timer's policy",
+        )?;
     }
     Some(())
 }
